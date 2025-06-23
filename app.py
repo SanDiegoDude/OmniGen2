@@ -66,6 +66,7 @@ def run(
     max_pixels,
     seed_input,
     progress=gr.Progress(),
+    align_res=False,
 ):
     input_images = [image_input_1, image_input_2, image_input_3]
     input_images = [img for img in input_images if img is not None]
@@ -109,6 +110,7 @@ def run(
         generator=generator,
         output_type="pil",
         step_func=progress_callback,
+        align_res=align_res,
     )
 
     progress(1.0)
@@ -611,33 +613,19 @@ def run_for_examples(
         seed_input,
     )
 
-description = """
-### 💡 Quick Tips for Best Results (see our [github](https://github.com/VectorSpaceLab/OmniGen2?tab=readme-ov-file#-usage-tips) for more details)
-- Image Quality: Use high-resolution images (at least 512x512 recommended).
-- Be Specific: Instead of "Add bird to desk", try "Add the bird from image 1 to the desk in image 2".
-- Use English: English prompts currently yield better results.
-- Adjust image_guidance_scale for better consistency with the reference image:
-    - Image Editing: 1.3 - 2.0
-    - In-context Generation: 2.0 - 3.0
-"""
-
-article = """
-citation to be added
-"""
-
 def main(args):
     # Gradio
     with gr.Blocks() as demo:
         gr.Markdown(
-            "# OmniGen2: Unified Image Generation [paper](https://arxiv.org/abs/2409.11340) [code](https://github.com/VectorSpaceLab/OmniGen2)"
+            "# OmniGen2: Unified Image Generation"
         )
-        gr.Markdown(description)
         with gr.Row():
             with gr.Column():
                 # text prompt
                 instruction = gr.Textbox(
-                    label='Enter your prompt. Use "first/second image" or "第一张图/第二张图" as reference.',
+                    label='Enter your prompt. Use "first/second image" as reference.',
                     placeholder="Type your prompt here...",
+                    lines=2,
                 )
 
                 with gr.Row(equal_height=True):
@@ -652,6 +640,14 @@ def main(args):
                     label="Enter your negative prompt",
                     placeholder="Type your negative prompt here...",
                     value=NEGATIVE_PROMPT,
+                )
+
+                # Aspect ratio and dimensions
+                aspect_ratio = gr.Dropdown(
+                    label="Aspect Ratio",
+                    choices=["Use Image1 Aspect Ratio", "1:1 (Square)", "4:3 (Landscape)", "3:4 (Portrait)", "16:9 (Widescreen)", "9:16 (Portrait)", "21:9 (Ultrawide)", "9:21 (Portrait)", "Custom"],
+                    value="1:1 (Square)",
+                    info="Select aspect ratio or choose Custom to set dimensions manually."
                 )
 
                 # slider
@@ -713,6 +709,30 @@ def main(args):
                     outputs=[cfg_range_start]
                 )
 
+                # Aspect ratio change handler
+                def update_dimensions_from_aspect(aspect_choice):
+                    aspect_ratios = {
+                        "1:1 (Square)": (1024, 1024),
+                        "4:3 (Landscape)": (1024, 768),
+                        "3:4 (Portrait)": (768, 1024),
+                        "16:9 (Widescreen)": (1024, 576),
+                        "9:16 (Portrait)": (576, 1024),
+                        "21:9 (Ultrawide)": (1024, 439),
+                        "9:21 (Portrait)": (439, 1024),
+                        "Custom": (1024, 1024),
+                        "Use Image1 Aspect Ratio": (1024, 1024),
+                    }
+                    if aspect_choice in aspect_ratios and aspect_choice != "Use Image1 Aspect Ratio":
+                        width, height = aspect_ratios[aspect_choice]
+                        return width, height
+                    return 1024, 1024
+
+                aspect_ratio.change(
+                    fn=update_dimensions_from_aspect,
+                    inputs=[aspect_ratio],
+                    outputs=[width_input, height_input]
+                )
+
                 with gr.Row(equal_height=True):
                     scheduler_input = gr.Dropdown(
                         label="Scheduler",
@@ -722,7 +742,7 @@ def main(args):
                     )
 
                     num_inference_steps = gr.Slider(
-                        label="Inference Steps", minimum=20, maximum=100, value=50, step=1
+                        label="Inference Steps", minimum=20, maximum=100, value=30, step=1
                     )
                 with gr.Row(equal_height=True):
                     num_images_per_prompt = gr.Slider(
@@ -734,7 +754,8 @@ def main(args):
                     )
 
                     seed_input = gr.Slider(
-                        label="Seed", minimum=-1, maximum=2147483647, value=0, step=1
+                        label="Seed", minimum=-1, maximum=2147483647, value=0, step=1,
+                        elem_id="seed-slider"
                     )
                 with gr.Row(equal_height=True):
                     max_input_image_side_length = gr.Slider(
@@ -756,6 +777,15 @@ def main(args):
                 with gr.Column():
                     # output image
                     output_image = gr.Image(label="Output Image")
+                    
+                    # Generation info box
+                    generation_info = gr.HTML(
+                        label="Generation Details",
+                        value="""
+                        <div style='background-color: #222; color: #eee; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 13px;'>No generation yet</div>
+                        """
+                    )
+                    
                     global save_images
                     save_images = gr.Checkbox(label="Save generated images", value=False)
 
@@ -768,9 +798,79 @@ def main(args):
 
         pipeline = load_pipeline(accelerator, weight_dtype, args)
 
+        def update_generation_info(instruction, width, height, scheduler, steps, negative_prompt, 
+                                 text_guidance, image_guidance, cfg_start, cfg_end, num_images, 
+                                 max_side, max_pixels, seed, output_img):
+            if output_img is None:
+                return """
+                <div style='background-color: #222; color: #eee; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 13px;'>No generation yet</div>
+                """
+            info_html = f"""
+            <div style='background-color: #222; color: #eee; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 13px;'>
+                <strong>Generation Parameters:</strong><br>
+                <strong>Prompt:</strong> {instruction}<br>
+                <strong>Negative Prompt:</strong> {negative_prompt}<br>
+                <strong>Dimensions:</strong> {width} × {height}<br>
+                <strong>Scheduler:</strong> {scheduler}<br>
+                <strong>Steps:</strong> {steps}<br>
+                <strong>Text Guidance:</strong> {text_guidance}<br>
+                <strong>Image Guidance:</strong> {image_guidance}<br>
+                <strong>CFG Range:</strong> {cfg_start} - {cfg_end}<br>
+                <strong>Images:</strong> {num_images}<br>
+                <strong>Max Side Length:</strong> {max_side}<br>
+                <strong>Max Pixels:</strong> {max_pixels:,}<br>
+                <strong>Seed:</strong> <span style='color: #4ea1ff; cursor: pointer; text-decoration: underline;' onclick='document.getElementById("seed-slider").value = "{seed}"; document.getElementById("seed-slider").dispatchEvent(new Event("input", {{ bubbles: true }}));'>{seed}</span>
+            </div>
+            """
+            return info_html
+
+        def run_with_align_res(
+            instruction,
+            width_input,
+            height_input,
+            scheduler,
+            num_inference_steps,
+            image_input_1,
+            image_input_2,
+            image_input_3,
+            negative_prompt,
+            guidance_scale_input,
+            img_guidance_scale_input,
+            cfg_range_start,
+            cfg_range_end,
+            num_images_per_prompt,
+            max_input_image_side_length,
+            max_pixels,
+            seed_input,
+            aspect_ratio_choice,
+            progress=gr.Progress(),
+        ):
+            align_res = aspect_ratio_choice == "Use Image1 Aspect Ratio"
+            return run(
+                instruction,
+                width_input,
+                height_input,
+                scheduler,
+                num_inference_steps,
+                image_input_1,
+                image_input_2,
+                image_input_3,
+                negative_prompt,
+                guidance_scale_input,
+                img_guidance_scale_input,
+                cfg_range_start,
+                cfg_range_end,
+                num_images_per_prompt,
+                max_input_image_side_length,
+                max_pixels,
+                seed_input,
+                progress=progress,
+                align_res=align_res,
+            )
+
         # click
         generate_button.click(
-            run,
+            run_with_align_res,
             inputs=[
                 instruction,
                 width_input,
@@ -789,22 +889,17 @@ def main(args):
                 max_input_image_side_length,
                 max_pixels,
                 seed_input,
+                aspect_ratio,
             ],
             outputs=output_image,
-        )
-
-        gr.Examples(
-            examples=get_example(),
-            fn=run_for_examples,
+        ).then(
+            update_generation_info,
             inputs=[
                 instruction,
                 width_input,
                 height_input,
                 scheduler_input,
                 num_inference_steps,
-                image_input_1,
-                image_input_2,
-                image_input_3,
                 negative_prompt,
                 text_guidance_scale_input,
                 image_guidance_scale_input,
@@ -814,11 +909,11 @@ def main(args):
                 max_input_image_side_length,
                 max_pixels,
                 seed_input,
+                output_image,
             ],
-            outputs=output_image,
+            outputs=generation_info,
         )
 
-        gr.Markdown(article)
     # launch
     demo.launch(share=args.share, server_port=args.port, server_name="0.0.0.0", allowed_paths=[ROOT_DIR])
 
