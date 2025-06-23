@@ -630,9 +630,9 @@ def main(args):
 
                 with gr.Row(equal_height=True):
                     # input images
-                    image_input_1 = gr.Image(label="First Image", type="pil")
-                    image_input_2 = gr.Image(label="Second Image", type="pil")
-                    image_input_3 = gr.Image(label="Third Image", type="pil")
+                    image_input_1 = gr.Image(label="Input Image 1", type="pil", height=320, width=320, show_label=True, elem_id="input-image-1")
+                    image_input_2 = gr.Image(label="Input Image 2", type="pil", height=320, width=320, show_label=True, elem_id="input-image-2")
+                    image_input_3 = gr.Image(label="Input Image 3", type="pil", height=320, width=320, show_label=True, elem_id="input-image-3")
 
                 generate_button = gr.Button("Generate Image")
 
@@ -653,10 +653,10 @@ def main(args):
                 # slider
                 with gr.Row(equal_height=True):
                     height_input = gr.Slider(
-                        label="Height", minimum=256, maximum=1024, value=1024, step=128
+                        label="Height", minimum=256, maximum=4096, value=1024, step=128
                     )
                     width_input = gr.Slider(
-                        label="Width", minimum=256, maximum=1024, value=1024, step=128
+                        label="Width", minimum=256, maximum=4096, value=1024, step=128
                     )
                 with gr.Row(equal_height=True):
                     text_guidance_scale_input = gr.Slider(
