@@ -621,11 +621,15 @@ def main(args):
         )
         with gr.Row():
             with gr.Column():
+                # Move Generate button to the top
+                generate_button = gr.Button("Generate Image")
+
                 # text prompt
                 instruction = gr.Textbox(
                     label='Enter your prompt. Use "first/second image" as reference.',
                     placeholder="Type your prompt here...",
                     lines=2,
+                    elem_id="prompt-box",
                 )
 
                 with gr.Row(equal_height=True):
@@ -634,8 +638,6 @@ def main(args):
                     image_input_2 = gr.Image(label="Input Image 2", type="pil", height=320, width=320, show_label=True, elem_id="input-image-2")
                     image_input_3 = gr.Image(label="Input Image 3", type="pil", height=320, width=320, show_label=True, elem_id="input-image-3")
 
-                generate_button = gr.Button("Generate Image")
-
                 negative_prompt = gr.Textbox(
                     label="Enter your negative prompt",
                     placeholder="Type your negative prompt here...",
@@ -643,6 +645,13 @@ def main(args):
                 )
 
                 # Aspect ratio and dimensions
+                aspect_ratio_multiplier = gr.Dropdown(
+                    label="Aspect Ratio Multiplier",
+                    choices=["x1", "x2", "x3", "x4"],
+                    value="x1",
+                    info="Multiply the default aspect ratio size by this factor."
+                )
+
                 aspect_ratio = gr.Dropdown(
                     label="Aspect Ratio",
                     choices=["Use Image1 Aspect Ratio", "1:1 (Square)", "4:3 (Landscape)", "3:4 (Portrait)", "16:9 (Widescreen)", "9:16 (Portrait)", "21:9 (Ultrawide)", "9:21 (Portrait)", "Custom"],
@@ -710,7 +719,7 @@ def main(args):
                 )
 
                 # Aspect ratio change handler
-                def update_dimensions_from_aspect(aspect_choice):
+                def update_dimensions_from_aspect_and_multiplier(aspect_choice, multiplier_choice):
                     aspect_ratios = {
                         "1:1 (Square)": (1024, 1024),
                         "4:3 (Landscape)": (1024, 768),
@@ -722,14 +731,22 @@ def main(args):
                         "Custom": (1024, 1024),
                         "Use Image1 Aspect Ratio": (1024, 1024),
                     }
-                    if aspect_choice in aspect_ratios and aspect_choice != "Use Image1 Aspect Ratio":
-                        width, height = aspect_ratios[aspect_choice]
+                    multiplier = int(multiplier_choice[1]) if multiplier_choice and multiplier_choice.startswith('x') else 1
+                    if aspect_choice in aspect_ratios and aspect_choice not in ["Custom", "Use Image1 Aspect Ratio"]:
+                        base_width, base_height = aspect_ratios[aspect_choice]
+                        width = min(base_width * multiplier, 4096)
+                        height = min(base_height * multiplier, 4096)
                         return width, height
                     return 1024, 1024
 
                 aspect_ratio.change(
-                    fn=update_dimensions_from_aspect,
-                    inputs=[aspect_ratio],
+                    fn=update_dimensions_from_aspect_and_multiplier,
+                    inputs=[aspect_ratio, aspect_ratio_multiplier],
+                    outputs=[width_input, height_input]
+                )
+                aspect_ratio_multiplier.change(
+                    fn=update_dimensions_from_aspect_and_multiplier,
+                    inputs=[aspect_ratio, aspect_ratio_multiplier],
                     outputs=[width_input, height_input]
                 )
 
@@ -869,7 +886,53 @@ def main(args):
             )
 
         # click
-        generate_button.click(
+        generate_event = generate_button.click(
+            run_with_align_res,
+            inputs=[
+                instruction,
+                width_input,
+                height_input,
+                scheduler_input,
+                num_inference_steps,
+                image_input_1,
+                image_input_2,
+                image_input_3,
+                negative_prompt,
+                text_guidance_scale_input,
+                image_guidance_scale_input,
+                cfg_range_start,
+                cfg_range_end,
+                num_images_per_prompt,
+                max_input_image_side_length,
+                max_pixels,
+                seed_input,
+                aspect_ratio,
+            ],
+            outputs=output_image,
+        ).then(
+            update_generation_info,
+            inputs=[
+                instruction,
+                width_input,
+                height_input,
+                scheduler_input,
+                num_inference_steps,
+                negative_prompt,
+                text_guidance_scale_input,
+                image_guidance_scale_input,
+                cfg_range_start,
+                cfg_range_end,
+                num_images_per_prompt,
+                max_input_image_side_length,
+                max_pixels,
+                seed_input,
+                output_image,
+            ],
+            outputs=generation_info,
+        )
+
+        # Add Enter key handler for prompt box
+        instruction.submit(
             run_with_align_res,
             inputs=[
                 instruction,
