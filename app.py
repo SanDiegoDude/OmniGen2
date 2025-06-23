@@ -636,7 +636,7 @@ def main(args):
             with gr.Column():
                 # text prompt
                 instruction = gr.Textbox(
-                    label='Enter your prompt. Use "first/second image" or “第一张图/第二张图” as reference.',
+                    label='Enter your prompt. Use "first/second image" or "第一张图/第二张图" as reference.',
                     placeholder="Type your prompt here...",
                 )
 
@@ -820,13 +820,13 @@ def main(args):
 
         gr.Markdown(article)
     # launch
-    demo.launch(share=args.share, server_port=args.port, allowed_paths=[ROOT_DIR])
+    demo.launch(share=args.share, server_port=args.port, server_name="0.0.0.0", allowed_paths=[ROOT_DIR])
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run the OmniGen2")
     parser.add_argument("--share", action="store_true", help="Share the Gradio app")
     parser.add_argument(
-        "--port", type=int, default=7860, help="Port to use for the Gradio app"
+        "--port", type=int, default=7550, help="Port to use for the Gradio app"
     )
     parser.add_argument(
         "--model_path",
