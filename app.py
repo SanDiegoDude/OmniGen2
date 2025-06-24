@@ -782,13 +782,33 @@ def main(args):
                         value=2048,
                         step=256,
                     )
-                    max_pixels = gr.Slider(
-                        label="max_pixels",
-                        minimum=256 * 256,
-                        maximum=1536 * 1536,
-                        value=1024 * 1024,
-                        step=256 * 256,
+                    max_pixels_mp = gr.Slider(
+                        label="Max Pixels (Megapixels)",
+                        minimum=0.1,
+                        maximum=16.8,
+                        value=1.6,
+                        step=0.1,
+                        elem_id="max-pixels-mp"
                     )
+                    
+                    max_pixels_display = gr.HTML(
+                        value="<div style='font-size: 12px; color: #666; margin-top: -10px;'>1.6 MP (≈1265×1265 square)</div>",
+                        elem_id="max-pixels-display"
+                    )
+
+                def update_max_pixels_display(mp_value):
+                    pixels = int(mp_value * 1_000_000)
+                    square_side = int((pixels) ** 0.5)
+                    return f"<div style='font-size: 12px; color: #666; margin-top: -10px;'>{mp_value} MP (≈{square_side}×{square_side} square)</div>"
+
+                def convert_mp_to_pixels(mp_value):
+                    return int(mp_value * 1_000_000)
+
+                max_pixels_mp.change(
+                    fn=update_max_pixels_display,
+                    inputs=[max_pixels_mp],
+                    outputs=[max_pixels_display]
+                )
 
             with gr.Column():
                 with gr.Column():
@@ -857,12 +877,13 @@ def main(args):
             cfg_range_end,
             num_images_per_prompt,
             max_input_image_side_length,
-            max_pixels,
+            max_pixels_mp,
             seed_input,
             aspect_ratio_choice,
             progress=gr.Progress(),
         ):
             align_res = aspect_ratio_choice == "Use Image1 Aspect Ratio"
+            max_pixels = int(max_pixels_mp * 1_000_000)
             return run(
                 instruction,
                 width_input,
@@ -904,7 +925,7 @@ def main(args):
                 cfg_range_end,
                 num_images_per_prompt,
                 max_input_image_side_length,
-                max_pixels,
+                max_pixels_mp,
                 seed_input,
                 aspect_ratio,
             ],
@@ -924,7 +945,7 @@ def main(args):
                 cfg_range_end,
                 num_images_per_prompt,
                 max_input_image_side_length,
-                max_pixels,
+                max_pixels_mp,
                 seed_input,
                 output_image,
             ],
@@ -950,7 +971,7 @@ def main(args):
                 cfg_range_end,
                 num_images_per_prompt,
                 max_input_image_side_length,
-                max_pixels,
+                max_pixels_mp,
                 seed_input,
                 aspect_ratio,
             ],
@@ -970,7 +991,7 @@ def main(args):
                 cfg_range_end,
                 num_images_per_prompt,
                 max_input_image_side_length,
-                max_pixels,
+                max_pixels_mp,
                 seed_input,
                 output_image,
             ],
