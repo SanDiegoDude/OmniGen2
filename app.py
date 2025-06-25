@@ -44,6 +44,22 @@ for logger_name in ["diffusers", "transformers", "omnigen2"]:
     logger = logging.getLogger(logger_name)
     logger.addFilter(CustomLogFilter())
 
+# Check for flash attention installation
+def check_flash_attention():
+    try:
+        import flash_attn
+        print("✅ Flash Attention detected - optimal performance enabled")
+        return True
+    except ImportError:
+        print("⚠️  Flash Attention not detected")
+        print("   For best performance, install with:")
+        print("   pip install flash-attn==2.7.4.post1 --no-build-isolation")
+        print("   (OmniGen2 will still work without it)")
+        return False
+
+# Run the check on startup
+check_flash_attention()
+
 # API imports
 try:
     from fastapi import FastAPI, HTTPException
@@ -154,6 +170,7 @@ def run(
     max_input_image_side_length,
     max_pixels,
     seed_input,
+    save_images_enabled=True,
     progress=gr.Progress(),
     align_res=False,
     args=None,
@@ -219,24 +236,36 @@ def run(
         vis_images = [to_tensor(image) * 2 - 1 for image in results.images]
         output_image = create_collage(vis_images)
 
-        if save_images:
-            # Create outputs directory if it doesn't exist
-            output_dir = os.path.join(ROOT_DIR, "outputs_gradio")
+        if save_images_enabled:
+            # Create date-based directory structure: ./outputs_gradio/YYYYMMDD/
+            date_str = datetime.now().strftime("%Y%m%d")
+            output_dir = os.path.join(ROOT_DIR, "outputs_gradio", date_str)
             os.makedirs(output_dir, exist_ok=True)
 
-            # Generate unique filename with timestamp
-            timestamp = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+            # Generate filename: YYMMDD-SEED-###.png
+            date_prefix = datetime.now().strftime("%y%m%d")
+            base_filename = f"{date_prefix}-{actual_seed}"
+            
+            # Find next available number for this seed
+            counter = 1
+            while True:
+                filename = f"{base_filename}-{counter:03d}.png"
+                output_path = os.path.join(output_dir, filename)
+                if not os.path.exists(output_path):
+                    break
+                counter += 1
 
-            # Generate unique filename with timestamp
-            output_path = os.path.join(output_dir, f"{timestamp}.png")
-            # Save the image
+            # Save the collage image
             output_image.save(output_path)
+            print(f"💾 Saved: {output_path}")
 
-            # Save All Generated Images
+            # Save individual images if multiple generated
             if len(results.images) > 1:
                 for i, image in enumerate(results.images):
-                    image_name, ext = os.path.splitext(output_path)
-                    image.save(f"{image_name}_{i}{ext}")
+                    individual_filename = f"{base_filename}-{counter:03d}_{i+1}.png"
+                    individual_path = os.path.join(output_dir, individual_filename)
+                    image.save(individual_path)
+                    print(f"💾 Saved: {individual_path}")
         
         return output_image, results.images, actual_seed
         
@@ -722,9 +751,9 @@ def run_for_examples(
 
 def main(args):
     # Gradio
-    with gr.Blocks() as demo:
+    with gr.Blocks(title="⚙️ OmniGen2 UI") as demo:
         gr.Markdown(
-            "# OmniGen2: Unified Image Generation"
+            "# ⚙️ OmniGen2: Unified Image Generation Advanced UI"
         )
         with gr.Row():
             with gr.Column():
@@ -773,19 +802,19 @@ def main(args):
                         label="Max Pixels (Megapixels)",
                         minimum=0.1,
                         maximum=16.8,
-                        value=1.6,
+                        value=1.05,
                         step=0.01,
                         elem_id="max-pixels-mp"
                     )
                     
                     lock_to_wh = gr.Checkbox(
                         label="Lock to W/H",
-                        value=False,
+                        value=True,
                         info="Lock megapixel value to current width/height dimensions"
                     )
                 
                 max_pixels_display = gr.HTML(
-                    value="<div style='font-size: 12px; color: #666; margin-top: -10px;'>1.6 MP (≈1265×1265 square)</div>",
+                    value="<div style='font-size: 12px; color: #666; margin-top: -10px;'>1.05 MP (≈1024×1024 square)</div>",
                     elem_id="max-pixels-display"
                 )
 
@@ -970,7 +999,7 @@ def main(args):
                     )
 
                     seed_input = gr.Slider(
-                        label="Seed", minimum=-1, maximum=2147483647, value=0, step=1,
+                        label="Seed", minimum=-1, maximum=2147483647, value=-1, step=1,
                         elem_id="seed-slider"
                     )
                 with gr.Row(equal_height=True):
@@ -996,7 +1025,7 @@ def main(args):
                     )
                     
                     global save_images
-                    save_images = gr.Checkbox(label="Save generated images", value=False)
+                    save_images = gr.Checkbox(label="Save generated images", value=True)
 
         global accelerator
         global pipeline
@@ -1068,6 +1097,7 @@ def main(args):
             max_pixels_mp,
             seed_input,
             aspect_ratio_choice,
+            save_images_enabled,
             progress=gr.Progress(),
         ):
             align_res = aspect_ratio_choice == "Use Image1 Aspect Ratio"
@@ -1090,16 +1120,12 @@ def main(args):
                 max_input_image_side_length,
                 max_pixels,
                 seed_input,
-                progress=progress,
-                align_res=align_res,
-                args=args,
+                save_images_enabled,
+                progress,
+                align_res,
+                args,
             )
-            # Return both the output image and the actual seed used
-            if isinstance(result, tuple):
-                output_image, all_images, actual_seed = result
-                return output_image, actual_seed
-            else:
-                return result, seed_input  # Fallback case
+            return result
 
         # Function to handle both generation and info update
         def generate_and_update_info(
@@ -1121,10 +1147,11 @@ def main(args):
             max_pixels_mp,
             seed_input,
             aspect_ratio,
+            save_images_enabled,
             progress=gr.Progress(),
         ):
             # Generate the image and get the actual seed used
-            output_image, actual_seed = run_with_align_res(
+            output_image, all_images, actual_seed = run_with_align_res(
                 instruction,
                 width_input,
                 height_input,
@@ -1143,6 +1170,7 @@ def main(args):
                 max_pixels_mp,
                 seed_input,
                 aspect_ratio,
+                save_images_enabled,
                 progress,
             )
             
@@ -1177,6 +1205,7 @@ def main(args):
                 max_pixels_mp,
                 seed_input,
                 aspect_ratio,
+                save_images,
             ],
             outputs=[output_image, generation_info],
         )
@@ -1203,6 +1232,7 @@ def main(args):
                 max_pixels_mp,
                 seed_input,
                 aspect_ratio,
+                save_images,
             ],
             outputs=[output_image, generation_info],
         )
@@ -1256,6 +1286,7 @@ if API_AVAILABLE:
                     max_input_image_side_length=request.max_input_image_side_length,
                     max_pixels=max_pixels,
                     seed_input=request.seed,
+                    save_images_enabled=False,  # Don't save for API requests
                     progress=None,
                     align_res=request.align_res,
                     args=args,
