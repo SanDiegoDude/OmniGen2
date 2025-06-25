@@ -8,6 +8,9 @@ import os
 import argparse
 import random
 from datetime import datetime
+import threading
+import time
+import logging
 
 import torch
 from torchvision.transforms.functional import to_pil_image, to_tensor
@@ -20,14 +23,52 @@ from omnigen2.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEu
 from omnigen2.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 from omnigen2.utils.img_util import create_collage
 
+# Configure logging to suppress noisy warnings
+logging.getLogger("diffusers").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+# Custom logging filter to suppress specific warnings
+class CustomLogFilter(logging.Filter):
+    def filter(self, record):
+        # Suppress specific warnings
+        suppressed_messages = [
+            "Keyword arguments {'trust_remote_code': True} are not expected",
+            "Expected types for transformer:",
+            "Using a slow image processor as",
+            "use_fast` is unset and a slow processor was saved"
+        ]
+        return not any(msg in record.getMessage() for msg in suppressed_messages)
+
+# Apply the filter to relevant loggers
+for logger_name in ["diffusers", "transformers", "omnigen2"]:
+    logger = logging.getLogger(logger_name)
+    logger.addFilter(CustomLogFilter())
+
+# API imports
+try:
+    from fastapi import FastAPI, HTTPException
+    from fastapi.responses import JSONResponse
+    from pydantic import BaseModel
+    from typing import Optional, List
+    import uvicorn
+    import base64
+    import io
+    from PIL import Image
+    API_AVAILABLE = True
+except ImportError:
+    API_AVAILABLE = False
+    print("FastAPI not available. Install with: pip install fastapi uvicorn")
+
 NEGATIVE_PROMPT = "(((deformed))), blurry, over saturation, bad anatomy, disfigured, poorly drawn face, mutation, mutated, (extra_limb), (ugly), (poorly drawn hands), fused fingers, messy drawing, broken legs censor, censored, censor_bar"
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 pipeline = None
 accelerator = None
 save_images = False
+load_on_demand = False
 
 def load_pipeline(accelerator, weight_dtype, args):
+    print("Loading pipeline...")
     pipeline = OmniGen2Pipeline.from_pretrained(
         args.model_path,
         torch_dtype=weight_dtype,
@@ -44,8 +85,56 @@ def load_pipeline(accelerator, weight_dtype, args):
         pipeline.enable_model_cpu_offload()
     else:
         pipeline = pipeline.to(accelerator.device)
+    print("Pipeline loaded successfully.")
     return pipeline
 
+def unload_pipeline():
+    global pipeline
+    if pipeline is not None:
+        print("Unloading pipeline...")
+        # Move to CPU and clear cache
+        if hasattr(pipeline, 'to'):
+            pipeline = pipeline.to('cpu')
+        del pipeline
+        pipeline = None
+        torch.cuda.empty_cache()
+        print("Pipeline unloaded.")
+
+def ensure_pipeline_loaded(args):
+    global pipeline, accelerator
+    if pipeline is None:
+        bf16 = True
+        if accelerator is None:
+            accelerator = Accelerator(mixed_precision="bf16" if bf16 else "no")
+        weight_dtype = torch.bfloat16 if bf16 else torch.float32
+        pipeline = load_pipeline(accelerator, weight_dtype, args)
+    return pipeline
+
+# API Models
+if API_AVAILABLE:
+    class GenerationRequest(BaseModel):
+        prompt: str
+        negative_prompt: Optional[str] = NEGATIVE_PROMPT
+        width: int = 1024
+        height: int = 1024
+        num_inference_steps: int = 30
+        text_guidance_scale: float = 5.0
+        image_guidance_scale: float = 2.0
+        cfg_range_start: float = 0.0
+        cfg_range_end: float = 1.0
+        num_images_per_prompt: int = 1
+        max_input_image_side_length: int = 2048
+        max_pixels_mp: float = 1.6
+        seed: int = 0
+        scheduler: str = "euler"
+        align_res: bool = False
+        input_images_b64: Optional[List[str]] = None
+
+    class GenerationResponse(BaseModel):
+        success: bool
+        images_b64: Optional[List[str]] = None
+        error: Optional[str] = None
+        seed_used: Optional[int] = None
 
 def run(
     instruction,
@@ -67,77 +156,95 @@ def run(
     seed_input,
     progress=gr.Progress(),
     align_res=False,
+    args=None,
 ):
-    input_images = [image_input_1, image_input_2, image_input_3]
-    input_images = [img for img in input_images if img is not None]
+    global load_on_demand
+    
+    try:
+        # Load pipeline if needed
+        if load_on_demand and args:
+            ensure_pipeline_loaded(args)
+        
+        input_images = [image_input_1, image_input_2, image_input_3]
+        input_images = [img for img in input_images if img is not None]
 
-    if len(input_images) == 0:
-        input_images = None
+        if len(input_images) == 0:
+            input_images = None
 
-    if seed_input == -1:
-        seed_input = random.randint(0, 2**16 - 1)
+        # Handle seed randomization properly
+        actual_seed = seed_input
+        if seed_input == -1:
+            actual_seed = random.randint(0, 2**31 - 1)
 
-    generator = torch.Generator(device=accelerator.device).manual_seed(seed_input)
+        generator = torch.Generator(device=accelerator.device).manual_seed(actual_seed)
 
-    def progress_callback(cur_step, timesteps):
-        frac = (cur_step + 1) / float(timesteps)
-        progress(frac)
+        def progress_callback(cur_step, timesteps):
+            if progress:
+                frac = (cur_step + 1) / float(timesteps)
+                progress(frac)
 
-    if scheduler == 'euler':
-        pipeline.scheduler = FlowMatchEulerDiscreteScheduler()
-    elif scheduler == 'dpmsolver':
-        pipeline.scheduler = DPMSolverMultistepScheduler(
-            algorithm_type="dpmsolver++",
-            solver_type="midpoint",
-            solver_order=2,
-            prediction_type="flow_prediction",
+        if scheduler == 'euler':
+            pipeline.scheduler = FlowMatchEulerDiscreteScheduler()
+        elif scheduler == 'dpmsolver':
+            pipeline.scheduler = DPMSolverMultistepScheduler(
+                algorithm_type="dpmsolver++",
+                solver_type="midpoint",
+                solver_order=2,
+                prediction_type="flow_prediction",
+            )
+
+        results = pipeline(
+            prompt=instruction,
+            input_images=input_images,
+            width=width_input,
+            height=height_input,
+            max_input_image_side_length=max_input_image_side_length,
+            max_pixels=max_pixels,
+            num_inference_steps=num_inference_steps,
+            max_sequence_length=1024,
+            text_guidance_scale=guidance_scale_input,
+            image_guidance_scale=img_guidance_scale_input,
+            cfg_range=(cfg_range_start, cfg_range_end),
+            negative_prompt=negative_prompt,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=generator,
+            output_type="pil",
+            step_func=progress_callback,
+            align_res=align_res,
         )
 
-    results = pipeline(
-        prompt=instruction,
-        input_images=input_images,
-        width=width_input,
-        height=height_input,
-        max_input_image_side_length=max_input_image_side_length,
-        max_pixels=max_pixels,
-        num_inference_steps=num_inference_steps,
-        max_sequence_length=1024,
-        text_guidance_scale=guidance_scale_input,
-        image_guidance_scale=img_guidance_scale_input,
-        cfg_range=(cfg_range_start, cfg_range_end),
-        negative_prompt=negative_prompt,
-        num_images_per_prompt=num_images_per_prompt,
-        generator=generator,
-        output_type="pil",
-        step_func=progress_callback,
-        align_res=align_res,
-    )
+        if progress:
+            progress(1.0)
 
-    progress(1.0)
+        vis_images = [to_tensor(image) * 2 - 1 for image in results.images]
+        output_image = create_collage(vis_images)
 
-    vis_images = [to_tensor(image) * 2 - 1 for image in results.images]
-    output_image = create_collage(vis_images)
+        if save_images:
+            # Create outputs directory if it doesn't exist
+            output_dir = os.path.join(ROOT_DIR, "outputs_gradio")
+            os.makedirs(output_dir, exist_ok=True)
 
-    if save_images:
-        # Create outputs directory if it doesn't exist
-        output_dir = os.path.join(ROOT_DIR, "outputs_gradio")
-        os.makedirs(output_dir, exist_ok=True)
+            # Generate unique filename with timestamp
+            timestamp = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
 
-        # Generate unique filename with timestamp
-        timestamp = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+            # Generate unique filename with timestamp
+            output_path = os.path.join(output_dir, f"{timestamp}.png")
+            # Save the image
+            output_image.save(output_path)
 
-        # Generate unique filename with timestamp
-        output_path = os.path.join(output_dir, f"{timestamp}.png")
-        # Save the image
-        output_image.save(output_path)
-
-        # Save All Generated Images
-        if len(results.images) > 1:
-            for i, image in enumerate(results.images):
-                image_name, ext = os.path.splitext(output_path)
-                image.save(f"{image_name}_{i}{ext}")
-    return output_image
-
+            # Save All Generated Images
+            if len(results.images) > 1:
+                for i, image in enumerate(results.images):
+                    image_name, ext = os.path.splitext(output_path)
+                    image.save(f"{image_name}_{i}{ext}")
+        
+        return output_image, results.images, actual_seed
+        
+    finally:
+        # Unload pipeline if in load-on-demand mode
+        if load_on_demand:
+            # Add a small delay to allow any pending operations to complete
+            threading.Timer(2.0, unload_pipeline).start()
 
 def get_example():
     case = [
@@ -645,10 +752,12 @@ def main(args):
                 )
 
                 # Aspect ratio and dimensions
-                aspect_ratio_multiplier = gr.Dropdown(
+                aspect_ratio_multiplier = gr.Slider(
                     label="Aspect Ratio Multiplier",
-                    choices=["x1", "x2", "x3", "x4"],
-                    value="x1",
+                    minimum=1.0,
+                    maximum=4.0,
+                    value=1.0,
+                    step=0.1,
                     info="Multiply the default aspect ratio size by this factor."
                 )
 
@@ -657,6 +766,27 @@ def main(args):
                     choices=["Use Image1 Aspect Ratio", "1:1 (Square)", "4:3 (Landscape)", "3:4 (Portrait)", "16:9 (Widescreen)", "9:16 (Portrait)", "21:9 (Ultrawide)", "9:21 (Portrait)", "Custom"],
                     value="1:1 (Square)",
                     info="Select aspect ratio or choose Custom to set dimensions manually."
+                )
+
+                with gr.Row(equal_height=True):
+                    max_pixels_mp = gr.Slider(
+                        label="Max Pixels (Megapixels)",
+                        minimum=0.1,
+                        maximum=16.8,
+                        value=1.6,
+                        step=0.01,
+                        elem_id="max-pixels-mp"
+                    )
+                    
+                    lock_to_wh = gr.Checkbox(
+                        label="Lock to W/H",
+                        value=False,
+                        info="Lock megapixel value to current width/height dimensions"
+                    )
+                
+                max_pixels_display = gr.HTML(
+                    value="<div style='font-size: 12px; color: #666; margin-top: -10px;'>1.6 MP (≈1265×1265 square)</div>",
+                    elem_id="max-pixels-display"
                 )
 
                 # slider
@@ -679,7 +809,7 @@ def main(args):
                     image_guidance_scale_input = gr.Slider(
                         label="Image Guidance Scale",
                         minimum=1.0,
-                        maximum=3.0,
+                        maximum=8.0,
                         value=2.0,
                         step=0.1,
                     )
@@ -731,23 +861,92 @@ def main(args):
                         "Custom": (1024, 1024),
                         "Use Image1 Aspect Ratio": (1024, 1024),
                     }
-                    multiplier = int(multiplier_choice[1]) if multiplier_choice and multiplier_choice.startswith('x') else 1
+                    multiplier = multiplier_choice
                     if aspect_choice in aspect_ratios and aspect_choice not in ["Custom", "Use Image1 Aspect Ratio"]:
                         base_width, base_height = aspect_ratios[aspect_choice]
-                        width = min(base_width * multiplier, 4096)
-                        height = min(base_height * multiplier, 4096)
+                        width = min(int(base_width * multiplier), 4096)
+                        height = min(int(base_height * multiplier), 4096)
                         return width, height
                     return 1024, 1024
 
+                def calculate_megapixels_from_dimensions(width, height):
+                    """Calculate megapixels from width and height."""
+                    return (width * height) / 1_000_000
+
+                def update_max_pixels_display(mp_value, width=None, height=None):
+                    """Update the megapixel display with both square estimate and actual dimensions if provided."""
+                    pixels = int(mp_value * 1_000_000)
+                    square_side = int((pixels) ** 0.5)
+                    
+                    if width is not None and height is not None:
+                        return f"<div style='font-size: 12px; color: #666; margin-top: -10px;'>{mp_value:.2f} MP (≈{square_side}×{square_side} square) | Current: {width}×{height} = {calculate_megapixels_from_dimensions(width, height):.2f} MP</div>"
+                    else:
+                        return f"<div style='font-size: 12px; color: #666; margin-top: -10px;'>{mp_value:.2f} MP (≈{square_side}×{square_side} square)</div>"
+
+                def update_dimensions_and_megapixels(aspect_choice, multiplier_choice, lock_enabled, current_mp, current_width, current_height):
+                    """Update dimensions and handle megapixel locking."""
+                    # Get new dimensions from aspect ratio
+                    new_width, new_height = update_dimensions_from_aspect_and_multiplier(aspect_choice, multiplier_choice)
+                    
+                    # If lock is enabled, update megapixels to match new dimensions
+                    if lock_enabled:
+                        new_mp = calculate_megapixels_from_dimensions(new_width, new_height)
+                        new_mp = max(0.1, min(new_mp, 16.8))  # Clamp to slider bounds
+                        return new_width, new_height, new_mp, update_max_pixels_display(new_mp, new_width, new_height)
+                    else:
+                        return new_width, new_height, current_mp, update_max_pixels_display(current_mp, new_width, new_height)
+
+                def update_megapixels_from_manual_dimensions(width, height, lock_enabled, current_mp):
+                    """Update megapixels when dimensions are manually changed."""
+                    if lock_enabled:
+                        new_mp = calculate_megapixels_from_dimensions(width, height)
+                        new_mp = max(0.1, min(new_mp, 16.8))  # Clamp to slider bounds
+                        return new_mp, update_max_pixels_display(new_mp, width, height)
+                    else:
+                        return current_mp, update_max_pixels_display(current_mp, width, height)
+
+                # Update aspect ratio handlers
                 aspect_ratio.change(
-                    fn=update_dimensions_from_aspect_and_multiplier,
-                    inputs=[aspect_ratio, aspect_ratio_multiplier],
-                    outputs=[width_input, height_input]
+                    fn=update_dimensions_and_megapixels,
+                    inputs=[aspect_ratio, aspect_ratio_multiplier, lock_to_wh, max_pixels_mp, width_input, height_input],
+                    outputs=[width_input, height_input, max_pixels_mp, max_pixels_display]
                 )
                 aspect_ratio_multiplier.change(
-                    fn=update_dimensions_from_aspect_and_multiplier,
-                    inputs=[aspect_ratio, aspect_ratio_multiplier],
-                    outputs=[width_input, height_input]
+                    fn=update_dimensions_and_megapixels,
+                    inputs=[aspect_ratio, aspect_ratio_multiplier, lock_to_wh, max_pixels_mp, width_input, height_input],
+                    outputs=[width_input, height_input, max_pixels_mp, max_pixels_display]
+                )
+
+                # Handle manual dimension changes
+                width_input.change(
+                    fn=update_megapixels_from_manual_dimensions,
+                    inputs=[width_input, height_input, lock_to_wh, max_pixels_mp],
+                    outputs=[max_pixels_mp, max_pixels_display]
+                )
+                height_input.change(
+                    fn=update_megapixels_from_manual_dimensions,
+                    inputs=[width_input, height_input, lock_to_wh, max_pixels_mp],
+                    outputs=[max_pixels_mp, max_pixels_display]
+                )
+
+                # Handle megapixel slider changes
+                max_pixels_mp.change(
+                    fn=lambda mp_val, w, h: update_max_pixels_display(mp_val, w, h),
+                    inputs=[max_pixels_mp, width_input, height_input],
+                    outputs=[max_pixels_display]
+                )
+
+                # Handle lock checkbox changes
+                lock_to_wh.change(
+                    fn=lambda lock_enabled, w, h, current_mp: (
+                        calculate_megapixels_from_dimensions(w, h) if lock_enabled else current_mp,
+                        update_max_pixels_display(
+                            calculate_megapixels_from_dimensions(w, h) if lock_enabled else current_mp, 
+                            w, h
+                        )
+                    ),
+                    inputs=[lock_to_wh, width_input, height_input, max_pixels_mp],
+                    outputs=[max_pixels_mp, max_pixels_display]
                 )
 
                 with gr.Row(equal_height=True):
@@ -782,33 +981,6 @@ def main(args):
                         value=2048,
                         step=256,
                     )
-                    max_pixels_mp = gr.Slider(
-                        label="Max Pixels (Megapixels)",
-                        minimum=0.1,
-                        maximum=16.8,
-                        value=1.6,
-                        step=0.1,
-                        elem_id="max-pixels-mp"
-                    )
-                    
-                    max_pixels_display = gr.HTML(
-                        value="<div style='font-size: 12px; color: #666; margin-top: -10px;'>1.6 MP (≈1265×1265 square)</div>",
-                        elem_id="max-pixels-display"
-                    )
-
-                def update_max_pixels_display(mp_value):
-                    pixels = int(mp_value * 1_000_000)
-                    square_side = int((pixels) ** 0.5)
-                    return f"<div style='font-size: 12px; color: #666; margin-top: -10px;'>{mp_value} MP (≈{square_side}×{square_side} square)</div>"
-
-                def convert_mp_to_pixels(mp_value):
-                    return int(mp_value * 1_000_000)
-
-                max_pixels_mp.change(
-                    fn=update_max_pixels_display,
-                    inputs=[max_pixels_mp],
-                    outputs=[max_pixels_display]
-                )
 
             with gr.Column():
                 with gr.Column():
@@ -828,12 +1000,18 @@ def main(args):
 
         global accelerator
         global pipeline
+        global load_on_demand
 
-        bf16 = True
-        accelerator = Accelerator(mixed_precision="bf16" if bf16 else "no")
-        weight_dtype = torch.bfloat16 if bf16 else torch.float32
+        load_on_demand = args.lod
 
-        pipeline = load_pipeline(accelerator, weight_dtype, args)
+        if not load_on_demand:
+            # Load pipeline immediately if not in load-on-demand mode
+            bf16 = True
+            accelerator = Accelerator(mixed_precision="bf16" if bf16 else "no")
+            weight_dtype = torch.bfloat16 if bf16 else torch.float32
+            pipeline = load_pipeline(accelerator, weight_dtype, args)
+        else:
+            print("Load-on-demand mode enabled. Models will be loaded when needed.")
 
         def update_generation_info(instruction, width, height, scheduler, steps, negative_prompt, 
                                  text_guidance, image_guidance, cfg_start, cfg_end, num_images, 
@@ -856,7 +1034,17 @@ def main(args):
                 <strong>Images:</strong> {num_images}<br>
                 <strong>Max Side Length:</strong> {max_side}<br>
                 <strong>Max Pixels:</strong> {max_pixels:,}<br>
-                <strong>Seed:</strong> <span style='color: #4ea1ff; cursor: pointer; text-decoration: underline;' onclick='document.getElementById("seed-slider").value = "{seed}"; document.getElementById("seed-slider").dispatchEvent(new Event("input", {{ bubbles: true }}));'>{seed}</span>
+                <strong>Seed:</strong> <span style='color: #4ea1ff; cursor: pointer; text-decoration: underline;' onclick='
+                    const seedElement = document.getElementById("seed-slider");
+                    if (seedElement) {{
+                        const input = seedElement.querySelector("input[type=\\"range\\"]") || seedElement.querySelector("input");
+                        if (input) {{
+                            input.value = "{seed}";
+                            input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                            input.dispatchEvent(new Event("change", {{ bubbles: true }}));
+                        }}
+                    }}
+                '>{seed}</span>
             </div>
             """
             return info_html
@@ -884,7 +1072,7 @@ def main(args):
         ):
             align_res = aspect_ratio_choice == "Use Image1 Aspect Ratio"
             max_pixels = int(max_pixels_mp * 1_000_000)
-            return run(
+            result = run(
                 instruction,
                 width_input,
                 height_input,
@@ -904,11 +1092,72 @@ def main(args):
                 seed_input,
                 progress=progress,
                 align_res=align_res,
+                args=args,
             )
+            # Return both the output image and the actual seed used
+            if isinstance(result, tuple):
+                output_image, all_images, actual_seed = result
+                return output_image, actual_seed
+            else:
+                return result, seed_input  # Fallback case
+
+        # Function to handle both generation and info update
+        def generate_and_update_info(
+            instruction,
+            width_input,
+            height_input,
+            scheduler_input,
+            num_inference_steps,
+            image_input_1,
+            image_input_2,
+            image_input_3,
+            negative_prompt,
+            text_guidance_scale_input,
+            image_guidance_scale_input,
+            cfg_range_start,
+            cfg_range_end,
+            num_images_per_prompt,
+            max_input_image_side_length,
+            max_pixels_mp,
+            seed_input,
+            aspect_ratio,
+            progress=gr.Progress(),
+        ):
+            # Generate the image and get the actual seed used
+            output_image, actual_seed = run_with_align_res(
+                instruction,
+                width_input,
+                height_input,
+                scheduler_input,
+                num_inference_steps,
+                image_input_1,
+                image_input_2,
+                image_input_3,
+                negative_prompt,
+                text_guidance_scale_input,
+                image_guidance_scale_input,
+                cfg_range_start,
+                cfg_range_end,
+                num_images_per_prompt,
+                max_input_image_side_length,
+                max_pixels_mp,
+                seed_input,
+                aspect_ratio,
+                progress,
+            )
+            
+            # Generate the info using the actual seed
+            info_html = update_generation_info(
+                instruction, width_input, height_input, scheduler_input, num_inference_steps, negative_prompt, 
+                text_guidance_scale_input, image_guidance_scale_input, cfg_range_start, cfg_range_end, num_images_per_prompt, 
+                max_input_image_side_length, max_pixels_mp, actual_seed, output_image
+            )
+            
+            return output_image, info_html
 
         # click
         generate_event = generate_button.click(
-            run_with_align_res,
+            generate_and_update_info,
             inputs=[
                 instruction,
                 width_input,
@@ -929,32 +1178,12 @@ def main(args):
                 seed_input,
                 aspect_ratio,
             ],
-            outputs=output_image,
-        ).then(
-            update_generation_info,
-            inputs=[
-                instruction,
-                width_input,
-                height_input,
-                scheduler_input,
-                num_inference_steps,
-                negative_prompt,
-                text_guidance_scale_input,
-                image_guidance_scale_input,
-                cfg_range_start,
-                cfg_range_end,
-                num_images_per_prompt,
-                max_input_image_side_length,
-                max_pixels_mp,
-                seed_input,
-                output_image,
-            ],
-            outputs=generation_info,
+            outputs=[output_image, generation_info],
         )
 
         # Add Enter key handler for prompt box
         instruction.submit(
-            run_with_align_res,
+            generate_and_update_info,
             inputs=[
                 instruction,
                 width_input,
@@ -975,31 +1204,89 @@ def main(args):
                 seed_input,
                 aspect_ratio,
             ],
-            outputs=output_image,
-        ).then(
-            update_generation_info,
-            inputs=[
-                instruction,
-                width_input,
-                height_input,
-                scheduler_input,
-                num_inference_steps,
-                negative_prompt,
-                text_guidance_scale_input,
-                image_guidance_scale_input,
-                cfg_range_start,
-                cfg_range_end,
-                num_images_per_prompt,
-                max_input_image_side_length,
-                max_pixels_mp,
-                seed_input,
-                output_image,
-            ],
-            outputs=generation_info,
+            outputs=[output_image, generation_info],
         )
 
     # launch
     demo.launch(share=args.share, server_port=args.port, server_name="0.0.0.0", allowed_paths=[ROOT_DIR])
+
+# API Server Implementation
+if API_AVAILABLE:
+    def create_api_server(args):
+        app = FastAPI(title="OmniGen2 API", version="1.0.0")
+        
+        def image_to_base64(image):
+            buffered = io.BytesIO()
+            image.save(buffered, format="PNG")
+            return base64.b64encode(buffered.getvalue()).decode()
+        
+        def base64_to_image(b64_string):
+            image_data = base64.b64decode(b64_string)
+            return Image.open(io.BytesIO(image_data))
+        
+        @app.post("/generate", response_model=GenerationResponse)
+        async def generate_image(request: GenerationRequest):
+            try:
+                # Convert input images from base64 if provided
+                input_images = [None, None, None]
+                if request.input_images_b64:
+                    for i, b64_img in enumerate(request.input_images_b64[:3]):
+                        if b64_img:
+                            input_images[i] = base64_to_image(b64_img)
+                
+                # Convert MP to pixels
+                max_pixels = int(request.max_pixels_mp * 1_000_000)
+                
+                # Generate image
+                result = run(
+                    instruction=request.prompt,
+                    width_input=request.width,
+                    height_input=request.height,
+                    scheduler=request.scheduler,
+                    num_inference_steps=request.num_inference_steps,
+                    image_input_1=input_images[0],
+                    image_input_2=input_images[1],
+                    image_input_3=input_images[2],
+                    negative_prompt=request.negative_prompt,
+                    guidance_scale_input=request.text_guidance_scale,
+                    img_guidance_scale_input=request.image_guidance_scale,
+                    cfg_range_start=request.cfg_range_start,
+                    cfg_range_end=request.cfg_range_end,
+                    num_images_per_prompt=request.num_images_per_prompt,
+                    max_input_image_side_length=request.max_input_image_side_length,
+                    max_pixels=max_pixels,
+                    seed_input=request.seed,
+                    progress=None,
+                    align_res=request.align_res,
+                    args=args,
+                )
+                
+                # Handle return values
+                if isinstance(result, tuple):
+                    output_image, all_images, seed_used = result
+                    images_b64 = [image_to_base64(img) for img in all_images]
+                else:
+                    # Fallback for single image
+                    images_b64 = [image_to_base64(result)]
+                    seed_used = request.seed
+                
+                return GenerationResponse(
+                    success=True,
+                    images_b64=images_b64,
+                    seed_used=seed_used
+                )
+                
+            except Exception as e:
+                return GenerationResponse(
+                    success=False,
+                    error=str(e)
+                )
+        
+        @app.get("/health")
+        async def health_check():
+            return {"status": "healthy", "load_on_demand": load_on_demand}
+        
+        return app
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run the OmniGen2")
@@ -1023,9 +1310,38 @@ def parse_args():
         action="store_true",
         help="Enable sequential CPU offload."
     )
+    parser.add_argument(
+        "--lod",
+        action="store_true",
+        help="Load on demand - only load models when generating, then unload to save VRAM."
+    )
+    parser.add_argument(
+        "--api",
+        nargs="?",
+        const=7551,
+        type=int,
+        help="Enable API server on specified port (default: 7551)"
+    )
     args = parser.parse_args()
     return args
 
 if __name__ == "__main__":
     args = parse_args()
+    
+    # Start API server if requested
+    if args.api is not None:
+        if not API_AVAILABLE:
+            print("ERROR: FastAPI not available. Install with: pip install fastapi uvicorn")
+            exit(1)
+        
+        api_app = create_api_server(args)
+        api_thread = threading.Thread(
+            target=lambda: uvicorn.run(api_app, host="0.0.0.0", port=args.api, log_level="info"),
+            daemon=True
+        )
+        api_thread.start()
+        print(f"API server starting on http://0.0.0.0:{args.api}")
+        time.sleep(1)  # Give API server time to start
+    
+    # Start Gradio interface
     main(args)
