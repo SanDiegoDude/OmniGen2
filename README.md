@@ -2,6 +2,9 @@
 
 A professional-grade Gradio interface for OmniGen2, the unified multimodal image generation model. This Advanced UI provides comprehensive controls, intelligent parameter management, and workflow optimization tools for serious image generation work.
 
+![image](https://github.com/user-attachments/assets/3342a85e-1e79-4d6a-8dd7-9e0c46f73687)
+
+
 **🔗 Original Project**: This UI is a fork of [OmniGen2](https://github.com/VectorSpaceLab/OmniGen2). Visit the original repository for detailed information about OmniGen2's development, training, research papers, and core capabilities.
 
 ## 🎯 About This UI
