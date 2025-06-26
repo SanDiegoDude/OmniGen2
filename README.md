@@ -1,52 +1,63 @@
 # ⚙️ OmniGen2: Advanced UI
 
-A professional-grade Gradio interface for OmniGen2, the unified multimodal image generation model. This Advanced UI provides comprehensive controls, intelligent parameter management, and workflow optimization tools for serious image generation work.
+A Gradio interface for OmniGen2 with comprehensive controls and workflow optimization features for image generation tasks.
 
 ![image](https://github.com/user-attachments/assets/3342a85e-1e79-4d6a-8dd7-9e0c46f73687)
-
 
 **🔗 Original Project**: This UI is a fork of [OmniGen2](https://github.com/VectorSpaceLab/OmniGen2). Visit the original repository for detailed information about OmniGen2's development, training, research papers, and core capabilities.
 
 ## 🎯 About This UI
 
-This is an **Advanced Gradio Interface** for OmniGen2, featuring a comprehensive set of tools and controls for professional image generation workflows. Built on top of the powerful OmniGen2 model, this UI provides an intuitive yet feature-rich experience for:
+This is an **Advanced Gradio Interface** for OmniGen2, providing tools and controls for image generation workflows. Built on top of the OmniGen2 model, this UI offers:
 
-- **Text-to-Image Generation** with advanced parameter control
-- **Instruction-guided Image Editing** with precision tools
+- **Text-to-Image Generation** with parameter control
+- **Instruction-guided Image Editing** 
 - **In-context Generation** with multi-image input support
-- **Professional Workflow Features** including seed management, aspect ratio controls, and batch generation
+- **Workflow Features** including seed management, aspect ratio controls, and batch generation
 
-## ✨ Advanced UI Features
+## ✨ Features
 
-### 🎛️ **Professional Controls**
-- **Smart Aspect Ratio System**: Pre-configured ratios (1:1, 4:3, 16:9, etc.) with custom multipliers
-- **Intelligent Megapixel Management**: Lock dimensions to megapixel values with real-time calculations
-- **Advanced Seed Control**: Proper randomization with seed reproduction capabilities
+### 🎛️ **Generation Controls**
+- **Aspect Ratio System**: Pre-configured ratios (1:1, 4:3, 16:9, etc.) with custom multipliers
+- **Megapixel Management**: Lock dimensions to megapixel values with real-time calculations
+- **Seed Control**: Randomization with seed reproduction capabilities
 - **CFG Range Control**: Fine-tune guidance application across generation steps
-- **Dual Guidance Scales**: Separate text and image guidance with extended ranges (up to 8.0)
+- **Dual Guidance Scales**: Separate text and image guidance (up to 8.0)
+
+### 🔧 **Advanced Settings**
+- **DPM Solver Parameters**: Algorithm type (dpmsolver++, sde-dpmsolver++), solver type (midpoint, heun), and solver order (1-3)
+- **Flow Scheduler Options**: Dynamic time shift for euler scheduler
+- **Sequence Length Control**: Adjustable max sequence length for complex prompts
+- **Use Karras Sigmas**: Alternative noise scheduling (when supported)
+
+### 🛑 **Generation Control**
+- **Hard Cancellation**: Cancel button that immediately stops generation and frees VRAM
+- **Thread Interruption**: True process interruption, not just UI cancellation
+- **Pipeline Management**: Automatic unloading (--lod mode) or reloading after cancellation
+- **OOM Recovery**: Automatic out-of-memory error handling with VRAM cleanup
 
 ### 🖼️ **Image Management**
 - **Multi-Image Input**: Support for up to 3 reference images
-- **Smart Image Processing**: Automatic resizing with aspect ratio preservation
-- **Generation History**: Detailed parameter tracking for each generation
-- **Clickable Seed Links**: One-click seed copying for easy reproduction
+- **Image Processing**: Automatic resizing with aspect ratio preservation
+- **Generation History**: Parameter tracking for each generation
+- **Clickable Seed Links**: One-click seed copying for reproduction
 
-### ⚡ **Performance & Efficiency**
+### ⚡ **Performance & Memory**
 - **Load-on-Demand**: Models load only when needed to save memory
 - **Automatic Memory Management**: Pipeline automatically unloads when not in use
-- **Progress Tracking**: Real-time generation progress with step counts
-- **Command-line CPU Offloading**: Available via launch arguments for lower VRAM systems
+- **Progress Tracking**: Real-time generation progress
+- **CPU Offloading**: Available via launch arguments for lower VRAM systems
+- **Error Display**: Errors shown in UI instead of requiring console monitoring
 
 ### 🔐 **AI Content Identification**
-- **Invisible Watermarking**: Silently applies invisible watermarks to identify AI-generated content
-- **Industry Standard**: Uses the same watermarking technology as major AI image generators
-- **Robust Detection**: Watermarks survive common image manipulations like compression and resizing
-- **Truly Invisible**: No UI notifications or visual indicators - completely transparent to users
+- **Invisible Watermarking**: Applies invisible watermarks to identify AI-generated content
+- **Detection Tools**: Built-in utilities for watermark verification
+- **Metadata Storage**: Comprehensive PNG metadata with generation parameters
 
-### 🎨 **User Experience**
-- **Intuitive Layout**: Organized controls with logical grouping
+### 🎨 **User Interface**
+- **Organized Layout**: Controls grouped logically with accordions
 - **Real-time Feedback**: Live parameter calculations and previews
-- **Professional Tooltips**: Detailed guidance for each parameter
+- **Error Handling**: Clear error messages displayed in the generation info box
 - **Responsive Design**: Optimized for various screen sizes
 
 ## 🚀 Quick Start
@@ -71,9 +82,7 @@ pip install torch==2.6.0 torchvision --extra-index-url https://download.pytorch.
 # 3.2 Install other required packages
 pip install -r requirements.txt
 
-# Note: Version 2.7.4.post1 is specified for compatibility with CUDA 12.4.
-# Feel free to use a newer version if you use CUDA 12.6 or they fixed this compatibility issue.
-# OmniGen2 runs even without flash-attn, though we recommend install it for best performance.
+# 3.3 Install flash attention for optimal performance
 pip install flash-attn==2.7.4.post1 --no-build-isolation
 ```
 
@@ -86,9 +95,7 @@ pip install torch==2.6.0 torchvision --index-url https://mirror.sjtu.edu.cn/pyto
 # Install other dependencies from Tsinghua mirror
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# Note: Version 2.7.4.post1 is specified for compatibility with CUDA 12.4.
-# Feel free to use a newer version if you use CUDA 12.6 or they fixed this compatibility issue.
-# OmniGen2 runs even without flash-attn, though we recommend install it for best performance.
+# Install flash attention for optimal performance
 pip install flash-attn==2.7.4.post1 --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
@@ -118,31 +125,44 @@ python app.py --share
 # Custom port
 python app.py --port 8080
 
-# Disable invisible watermarking (not recommended)
+# Disable invisible watermarking
 python app.py --disable_watermark
 
 # All options combined
 python app.py --lod --api --port 8080
 ```
 
-## 💡 Advanced Usage Tips
+## 💡 Usage Tips
 
-### 🎯 **Parameter Optimization**
+### 🎯 **Parameter Guidelines**
 
-- **Text Guidance Scale (1.0-8.0)**: Higher values make the model follow your prompt more strictly
-  - *Recommended*: 3.0-6.0 for most use cases
-  - *Lower (1.0-3.0)*: More creative, less prompt adherence
-  - *Higher (6.0-8.0)*: Strict prompt following, may reduce creativity
+- **Text Guidance Scale (1.0-8.0)**: Higher values increase prompt adherence
+  - *Lower (1.0-3.5)*: More creative interpretation
+  - *Recommended*: 3.5-5.0 for most use cases, good balance of creativity and prompt adherenace
+  - *Higher (5.0-8.0)*: CFG Burn zone, strict prompt following
 
 - **Image Guidance Scale (1.0-8.0)**: Controls reference image influence
-  - *For Editing*: 1.2-2.0 (allows text prompt to modify the image)
-  - *For Style Transfer*: 2.5-4.0 (maintains image structure)
-  - *For Exact Reproduction*: 5.0-8.0 (minimal changes to reference)
+  - *For Editing*: 1.2-2.0 (Primarily text prompt focused, only minor image influence)
+  - *For Style Transfer*: 2.5-5.0 (maintains better image structure with more reference back to input images but with less prompt coherence)
+  - *For Close Reproduction*: 5.0-8.0 (Images will dominate output, will start to get rough past about 5.5 or so)
 
 - **CFG Range (0.0-1.0)**: Define when guidance is applied during generation
+  - *VERY CREATIVE CHANGES*: changing the start and/or end guidance can have massive changes on the style and visual layout of the output.
   - *Start*: When to begin applying guidance (0.0 = from beginning)
   - *End*: When to stop applying guidance (1.0 = until end)
-  - *Tip*: Reducing end value (e.g., 0.8) can speed up generation with minimal quality loss
+  - *Tip*: Reducing end value (e.g., 0.8) can speed up generation
+
+### 🔧 **Advanced Settings**
+
+- **DPM Algorithm Type**: 
+  - *dpmsolver++*: Standard algorithm
+  - *sde-dpmsolver++*: Adds controlled randomness for varied outputs
+  
+- **DPM Solver Type**:
+  - *midpoint*: Standard numerical integration
+  - *heun*: Alternative integration method
+  
+- **DPM Solver Order**: Higher order (3) = more accurate but slower
 
 ### 🖼️ **Multi-Image Workflows**
 
@@ -153,30 +173,33 @@ python app.py --lod --api --port 8080
 
 ### ⚙️ **Memory Management**
 
-- **Load-on-Demand (`--lod`)**: Essential for systems with <20GB VRAM
-- **CPU Offloading (Command-line)**: Enable with `--enable_model_cpu_offload` or `--enable_sequential_cpu_offload`
-- **Batch Generation**: Use multiple images per prompt efficiently
+- **Load-on-Demand (`--lod`)**: Recommended for systems with <20GB VRAM
+- **CPU Offloading**: Enable with `--enable_model_cpu_offload` or `--enable_sequential_cpu_offload`
+- **Cancellation**: Use Cancel button to immediately stop generation and free VRAM
 - **Resolution Management**: Use megapixel limits to control memory usage
+
+### 🛑 **Generation Control**
+
+- **Cancel Button**: Immediately stops generation using thread interruption
+- **Hard Interruption**: Actually stops the generation process, not just the UI
+- **Automatic Recovery**: Pipeline automatically reloads after cancellation (non-lod mode)
+- **Error Handling**: OOM and other errors are displayed in the generation info box
 
 ### 🔐 **AI Content Watermarking**
 
-This Advanced UI includes **invisible watermarking** to help identify AI-generated content, promoting responsible AI use and content authenticity.
+This UI includes **invisible watermarking** to help identify AI-generated content.
 
 #### **What is Invisible Watermarking?**
-- **Completely Invisible**: Watermarks are imperceptible to humans but detectable by algorithms
+- **Invisible**: Watermarks are imperceptible to humans but detectable by algorithms
 - **Robust**: Survives common image manipulations (compression, resizing, cropping)
-- **Industry Standard**: Uses the same technology as Stable Diffusion and other major AI generators
-- **Privacy-Safe**: No tracking or personal information embedded
+- **Standard**: Uses the same technology as other AI generators
 
 #### **How It Works**
-- Silently embeds "OmniGen2-AI" watermark in all generated images
-- Watermark is added to image frequency domain (invisible to human eye)
+- Embeds "OmniGen2-AI" watermark in all generated images
+- Watermark is added to image frequency domain 
 - Can be detected using compatible detection tools (see `utilities/` folder)
-- Adds negligible processing time (~50ms per image)
 
 #### **Disabling Watermarks**
-While we recommend keeping watermarks enabled for responsible AI use, you can disable them:
-
 ```bash
 # Disable watermarking
 python app.py --disable_watermark
@@ -187,14 +210,8 @@ curl -X POST "http://localhost:7551/generate" \
   -d '{"prompt": "a cat", "disable_watermark": true}'
 ```
 
-#### **Technical Details**
-- **Library**: Uses `invisible-watermark` (MIT licensed)
-- **Method**: DWT-DCT frequency domain embedding
-- **Watermark Text**: "OmniGen2-AI" (11 characters)
-- **Detection**: Requires compatible decoder with correct text length
-
 #### **Utilities for Watermark Detection**
-The `utilities/` folder contains helpful scripts:
+The `utilities/` folder contains scripts:
 
 ```bash
 # Check if an image has metadata and watermarks
@@ -203,8 +220,6 @@ python utilities/check_metadata.py path/to/your/image.png
 # Test watermarking functionality
 python utilities/test_watermark.py
 ```
-
-**Note**: Windows doesn't show PNG text metadata in file properties - use the utilities above to verify watermarks.
 
 ## 💻 System Requirements
 
@@ -226,7 +241,7 @@ python utilities/test_watermark.py
 
 ```
 OmniGen2/
-├── app.py                 # 🎯 Main Advanced UI (THIS FILE)
+├── app.py                 # 🎯 Main Advanced UI
 ├── requirements.txt       # 📦 Dependencies
 ├── LICENSE               # 📄 License information
 ├── omnigen2/            # 🧠 Core model code
@@ -239,6 +254,26 @@ OmniGen2/
     ├── app_chat.py     # Chat-based interface
     ├── inference.py    # Command-line inference
     └── example_*.sh    # Usage examples
+```
+
+## 🔧 API Usage
+
+When launched with `--api`, the UI provides a REST API:
+
+```bash
+# Start with API
+python app.py --api
+
+# Basic generation request
+curl -X POST "http://localhost:7551/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a beautiful landscape",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 30,
+    "text_guidance_scale": 5.0
+  }'
 ```
 
 ## ❤️ Citing the Original Work
@@ -256,7 +291,9 @@ This UI is built on top of OmniGen2. If you use this work, please cite the origi
 
 ## 📄 License
 
-This work is licensed under Apache 2.0 license. The original OmniGen2 model and code are also licensed under Apache 2.0.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+The invisible watermarking functionality uses the `invisible-watermark` library, which is also MIT licensed.
 
 ---
 
