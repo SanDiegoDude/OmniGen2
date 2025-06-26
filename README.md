@@ -34,6 +34,12 @@ This is an **Advanced Gradio Interface** for OmniGen2, featuring a comprehensive
 - **Progress Tracking**: Real-time generation progress with step counts
 - **Command-line CPU Offloading**: Available via launch arguments for lower VRAM systems
 
+### 🔐 **AI Content Identification**
+- **Invisible Watermarking**: Silently applies invisible watermarks to identify AI-generated content
+- **Industry Standard**: Uses the same watermarking technology as major AI image generators
+- **Robust Detection**: Watermarks survive common image manipulations like compression and resizing
+- **Truly Invisible**: No UI notifications or visual indicators - completely transparent to users
+
 ### 🎨 **User Experience**
 - **Intuitive Layout**: Organized controls with logical grouping
 - **Real-time Feedback**: Live parameter calculations and previews
@@ -109,6 +115,9 @@ python app.py --share
 # Custom port
 python app.py --port 8080
 
+# Disable invisible watermarking (not recommended)
+python app.py --disable_watermark
+
 # All options combined
 python app.py --lod --api --port 8080
 ```
@@ -146,6 +155,54 @@ python app.py --lod --api --port 8080
 - **Batch Generation**: Use multiple images per prompt efficiently
 - **Resolution Management**: Use megapixel limits to control memory usage
 
+### 🔐 **AI Content Watermarking**
+
+This Advanced UI includes **invisible watermarking** to help identify AI-generated content, promoting responsible AI use and content authenticity.
+
+#### **What is Invisible Watermarking?**
+- **Completely Invisible**: Watermarks are imperceptible to humans but detectable by algorithms
+- **Robust**: Survives common image manipulations (compression, resizing, cropping)
+- **Industry Standard**: Uses the same technology as Stable Diffusion and other major AI generators
+- **Privacy-Safe**: No tracking or personal information embedded
+
+#### **How It Works**
+- Silently embeds "OmniGen2-AI" watermark in all generated images
+- Watermark is added to image frequency domain (invisible to human eye)
+- Can be detected using compatible detection tools (see `utilities/` folder)
+- Adds negligible processing time (~50ms per image)
+
+#### **Disabling Watermarks**
+While we recommend keeping watermarks enabled for responsible AI use, you can disable them:
+
+```bash
+# Disable watermarking
+python app.py --disable_watermark
+
+# API requests can also disable watermarking per request
+curl -X POST "http://localhost:7551/generate" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a cat", "disable_watermark": true}'
+```
+
+#### **Technical Details**
+- **Library**: Uses `invisible-watermark` (MIT licensed)
+- **Method**: DWT-DCT frequency domain embedding
+- **Watermark Text**: "OmniGen2-AI" (11 characters)
+- **Detection**: Requires compatible decoder with correct text length
+
+#### **Utilities for Watermark Detection**
+The `utilities/` folder contains helpful scripts:
+
+```bash
+# Check if an image has metadata and watermarks
+python utilities/check_metadata.py path/to/your/image.png
+
+# Test watermarking functionality
+python utilities/test_watermark.py
+```
+
+**Note**: Windows doesn't show PNG text metadata in file properties - use the utilities above to verify watermarks.
+
 ## 💻 System Requirements
 
 - **GPU**: NVIDIA RTX 3090 or equivalent (17GB+ VRAM recommended)
@@ -171,7 +228,9 @@ OmniGen2/
 ├── LICENSE               # 📄 License information
 ├── omnigen2/            # 🧠 Core model code
 ├── assets/              # 🖼️ UI assets and examples
-├── example_images/      # 📸 Sample images for testing
+├── utilities/           # 🔧 Utility scripts
+│   ├── check_metadata.py # Check PNG metadata in generated images
+│   └── test_watermark.py # Test watermarking functionality
 └── demo/               # 📚 Example scripts and basic demos
     ├── app_basic.py    # Simple UI version
     ├── app_chat.py     # Chat-based interface
