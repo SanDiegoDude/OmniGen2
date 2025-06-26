@@ -12,6 +12,11 @@ import threading
 import time
 import logging
 import json
+import gc
+import traceback
+import signal
+import ctypes
+import sys
 
 import torch
 from torchvision.transforms.functional import to_pil_image, to_tensor
@@ -39,6 +44,54 @@ except ImportError:
 # Configure logging to suppress noisy warnings
 logging.getLogger("diffusers").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
+
+# Global variables for cancellation control
+generation_cancelled = False
+generation_thread = None
+cancel_event = threading.Event()
+generation_result = None
+generation_exception = None
+
+class ThreadKilledException(Exception):
+    """Exception raised when a thread is forcibly killed"""
+    pass
+
+def terminate_thread(thread):
+    """Forcibly terminate a thread using ctypes (Windows/Linux compatible)"""
+    if thread is None or not thread.is_alive():
+        return False
+    
+    thread_id = thread.ident
+    try:
+        # This is a low-level way to raise an exception in another thread
+        # It's not guaranteed to work in all cases, but it's the best we can do in Python
+        if sys.platform == "win32":
+            # Windows
+            res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_long(thread_id), 
+                ctypes.py_object(ThreadKilledException)
+            )
+        else:
+            # Unix/Linux - use signal if possible
+            res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_long(thread_id), 
+                ctypes.py_object(ThreadKilledException)
+            )
+        
+        if res == 0:
+            print("⚠️ Thread termination failed - invalid thread ID")
+            return False
+        elif res != 1:
+            # Clean up if we accidentally raised exception in multiple threads
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(thread_id), None)
+            print("⚠️ Thread termination failed - multiple threads affected")
+            return False
+        
+        print("🛑 Thread forcibly terminated")
+        return True
+    except Exception as e:
+        print(f"⚠️ Failed to terminate thread: {e}")
+        return False
 
 def create_png_metadata(
     instruction, width, height, scheduler, num_inference_steps, negative_prompt, 
@@ -219,13 +272,33 @@ def unload_pipeline():
         print("Pipeline unloaded.")
 
 def ensure_pipeline_loaded(args):
+    """Ensure pipeline is loaded for load-on-demand mode or after cancellation"""
     global pipeline, accelerator
     if pipeline is None:
+        print("Loading pipeline for generation...")
         bf16 = True
         if accelerator is None:
             accelerator = Accelerator(mixed_precision="bf16" if bf16 else "no")
         weight_dtype = torch.bfloat16 if bf16 else torch.float32
         pipeline = load_pipeline(accelerator, weight_dtype, args)
+        print("Pipeline loaded successfully.")
+
+def reload_pipeline_if_needed(args):
+    """Reload pipeline if it was unloaded due to cancellation"""
+    global pipeline, accelerator, load_on_demand
+    
+    if not load_on_demand and pipeline is None:
+        print("🔄 Reloading pipeline after cancellation...")
+        try:
+            bf16 = True
+            if accelerator is None:
+                accelerator = Accelerator(mixed_precision="bf16" if bf16 else "no")
+            weight_dtype = torch.bfloat16 if bf16 else torch.float32
+            pipeline = load_pipeline(accelerator, weight_dtype, args)
+            print("✅ Pipeline reloaded successfully")
+        except Exception as e:
+            print(f"❌ Failed to reload pipeline: {e}")
+            raise e
     return pipeline
 
 # API Models
@@ -273,17 +346,34 @@ def run(
     max_input_image_side_length,
     max_pixels,
     seed_input,
+    # Advanced parameters
+    rotary_theta=10000,
+    max_sequence_length=256,
+    dpm_algorithm_type="sde-dpmsolver++",
+    dpm_solver_type="heun",
+    dpm_solver_order=3,
+    use_karras_sigmas=False,
+    enable_dynamic_thresholding=False,
+    dynamic_thresholding_ratio=0.95,
+    enable_dynamic_time_shift=True,
     save_images_enabled=True,
     progress=gr.Progress(),
     align_res=False,
     args=None,
 ):
-    global load_on_demand
+    global load_on_demand, generation_cancelled, cancel_event
     
     try:
-        # Load pipeline if needed
+        # Check for cancellation before starting
+        if generation_cancelled or cancel_event.is_set():
+            raise ThreadKilledException("Generation cancelled before starting")
+        
+        # Load pipeline if needed or reload if unloaded
         if load_on_demand and args:
             ensure_pipeline_loaded(args)
+        elif args:
+            # Try to reload pipeline if it was unloaded due to cancellation
+            reload_pipeline_if_needed(args)
         
         input_images = [image_input_1, image_input_2, image_input_3]
         input_images = [img for img in input_images if img is not None]
@@ -296,22 +386,66 @@ def run(
         if seed_input == -1:
             actual_seed = random.randint(0, 2**31 - 1)
 
+        # Check for cancellation before generating
+        if generation_cancelled or cancel_event.is_set():
+            raise ThreadKilledException("Generation cancelled before torch.Generator creation")
+        
         generator = torch.Generator(device=accelerator.device).manual_seed(actual_seed)
 
         def progress_callback(cur_step, timesteps):
+            global generation_cancelled, cancel_event
+            # Check for cancellation
+            if cancel_event.is_set() or generation_cancelled:
+                print("🛑 Generation cancelled during progress callback")
+                # Raise exception to stop generation
+                raise ThreadKilledException("Generation cancelled during progress")
             if progress:
                 frac = (cur_step + 1) / float(timesteps)
                 progress(frac)
 
         if scheduler == 'euler':
-            pipeline.scheduler = FlowMatchEulerDiscreteScheduler()
+            # Try to use advanced parameters if supported
+            try:
+                pipeline.scheduler = FlowMatchEulerDiscreteScheduler(
+                    dynamic_time_shift=enable_dynamic_time_shift
+                )
+            except TypeError:
+                # Fallback to basic initialization if parameter not supported
+                pipeline.scheduler = FlowMatchEulerDiscreteScheduler()
+                if enable_dynamic_time_shift:
+                    print("Note: dynamic_time_shift not supported in this version of FlowMatchEulerDiscreteScheduler")
         elif scheduler == 'dpmsolver':
-            pipeline.scheduler = DPMSolverMultistepScheduler(
-                algorithm_type="dpmsolver++",
-                solver_type="midpoint",
-                solver_order=2,
-                prediction_type="flow_prediction",
-            )
+            # Build scheduler kwargs based on what's supported
+            scheduler_kwargs = {
+                "algorithm_type": dpm_algorithm_type,
+                "solver_type": dpm_solver_type,
+                "solver_order": dpm_solver_order,
+                "prediction_type": "flow_prediction",
+            }
+            
+            # Try to add advanced parameters if supported
+            try:
+                # Test if use_karras_sigmas is supported
+                test_scheduler = DPMSolverMultistepScheduler(**scheduler_kwargs, use_karras_sigmas=False)
+                scheduler_kwargs["use_karras_sigmas"] = use_karras_sigmas
+            except TypeError:
+                if use_karras_sigmas:
+                    print("Note: use_karras_sigmas not supported in this version of DPMSolverMultistepScheduler")
+            
+            # Handle dynamic thresholding parameters
+            if enable_dynamic_thresholding:
+                try:
+                    # In newer versions it's called 'thresholding'
+                    scheduler_kwargs["thresholding"] = True
+                    scheduler_kwargs["dynamic_thresholding_ratio"] = dynamic_thresholding_ratio
+                except:
+                    print("Note: dynamic thresholding not supported in this version of DPMSolverMultistepScheduler")
+            
+            pipeline.scheduler = DPMSolverMultistepScheduler(**scheduler_kwargs)
+
+        # Final cancellation check before pipeline execution
+        if generation_cancelled or cancel_event.is_set():
+            raise ThreadKilledException("Generation cancelled before pipeline execution")
 
         results = pipeline(
             prompt=instruction,
@@ -321,7 +455,7 @@ def run(
             max_input_image_side_length=max_input_image_side_length,
             max_pixels=max_pixels,
             num_inference_steps=num_inference_steps,
-            max_sequence_length=1024,
+            max_sequence_length=max_sequence_length,
             text_guidance_scale=guidance_scale_input,
             image_guidance_scale=img_guidance_scale_input,
             cfg_range=(cfg_range_start, cfg_range_end),
@@ -331,6 +465,8 @@ def run(
             output_type="pil",
             step_func=progress_callback,
             align_res=align_res,
+            # Note: rotary_theta would need to be set on the transformer model
+            # during initialization, not passed to the pipeline call
         )
 
         if progress:
@@ -393,6 +529,14 @@ def run(
         
         return output_image, watermarked_images, actual_seed
         
+    except ThreadKilledException as e:
+        print(f"🛑 Generation forcibly cancelled: {e}")
+        # Re-raise to be handled by the calling function
+        raise e
+    except Exception as e:
+        print(f"❌ Unexpected error in generation: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise e
     finally:
         # Unload pipeline if in load-on-demand mode
         if load_on_demand:
@@ -556,7 +700,9 @@ def main(args):
         with gr.Row():
             with gr.Column():
                 # Move Generate button to the top
-                generate_button = gr.Button("Generate Image")
+                with gr.Row():
+                    generate_button = gr.Button("Generate Image", scale=4, variant="primary")
+                    cancel_button = gr.Button("Cancel", scale=1, variant="secondary")
 
                 # text prompt
                 instruction = gr.Textbox(
@@ -638,38 +784,74 @@ def main(args):
                             scale=1
                         )
 
-                with gr.Row(equal_height=True):
-                    text_guidance_scale_input = gr.Slider(
-                        label="Text Guidance Scale",
-                        minimum=1.0,
-                        maximum=8.0,
-                        value=5.0,
-                        step=0.1,
-                    )
+                # Generation Settings accordion (open by default)
+                with gr.Accordion("Generation Settings", open=True):
+                    with gr.Row(equal_height=True):
+                        text_guidance_scale_input = gr.Slider(
+                            label="Text Guidance Scale",
+                            minimum=1.0,
+                            maximum=8.0,
+                            value=5.0,
+                            step=0.1,
+                        )
 
-                    image_guidance_scale_input = gr.Slider(
-                        label="Image Guidance Scale",
-                        minimum=1.0,
-                        maximum=8.0,
-                        value=5.0,
-                        step=0.1,
-                    )
-                with gr.Row(equal_height=True):
-                    cfg_range_start = gr.Slider(
-                        label="CFG Range Start",
-                        minimum=0.0,
-                        maximum=1.0,
-                        value=0.1,
-                        step=0.1,
-                    )
+                        image_guidance_scale_input = gr.Slider(
+                            label="Image Guidance Scale",
+                            minimum=1.0,
+                            maximum=8.0,
+                            value=5.0,
+                            step=0.1,
+                        )
+                    with gr.Row(equal_height=True):
+                        cfg_range_start = gr.Slider(
+                            label="CFG Range Start",
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=0.1,
+                            step=0.1,
+                        )
 
-                    cfg_range_end = gr.Slider(
-                        label="CFG Range End",
-                        minimum=0.0,
-                        maximum=1.0,
-                        value=0.5,
-                        step=0.1,
-                    )
+                        cfg_range_end = gr.Slider(
+                            label="CFG Range End",
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=0.5,
+                            step=0.1,
+                        )
+                    
+                    with gr.Row(equal_height=True):
+                        scheduler_input = gr.Dropdown(
+                            label="Scheduler",
+                            choices=["euler", "dpmsolver"],
+                            value="dpmsolver",
+                            info="The scheduler to use for the model.",
+                        )
+
+                        num_inference_steps = gr.Slider(
+                            label="Inference Steps", minimum=20, maximum=100, value=30, step=1
+                        )
+                    with gr.Row(equal_height=True):
+                        num_images_per_prompt = gr.Slider(
+                            label="Number of images per prompt",
+                            minimum=1,
+                            maximum=4,
+                            value=1,
+                            step=1,
+                        )
+
+                        seed_input = gr.Slider(
+                            label="Seed", minimum=-1, maximum=2147483647, value=-1, step=1,
+                            elem_id="seed-slider"
+                        )
+                    with gr.Row(equal_height=True):
+                        max_input_image_side_length = gr.Slider(
+                            label="Max Input Image Side Length",
+                            minimum=256,
+                            maximum=2048,
+                            value=1024,
+                            step=256,
+                            info="Maximum side length for input images before resizing"
+                        )
                 
                 def adjust_end_slider(start_val, end_val):
                     return max(start_val, end_val)
@@ -790,6 +972,89 @@ def main(args):
                     outputs=[max_pixels_mp, max_pixels_display]
                 )
 
+                # Advanced Settings accordion (closed by default)
+                with gr.Accordion("Advanced Settings", open=False):
+                    gr.Markdown("*Note: Some parameters may not be supported depending on your diffusers version. Unsupported parameters will be ignored with a console message.*")
+                    
+                    with gr.Row(equal_height=True):
+                        # Hide rotary_theta - keep as hidden component for compatibility
+                        rotary_theta = gr.Slider(
+                            label="Rotary Position Embedding Theta",
+                            minimum=1000,
+                            maximum=50000,
+                            value=10000,
+                            step=1000,
+                            visible=False  # Hidden
+                        )
+                        
+                        max_sequence_length = gr.Slider(
+                            label="Max Sequence Length",
+                            minimum=256,
+                            maximum=1024,
+                            value=256,
+                            step=64,
+                            info="Maximum sequence length for text encoding - longer for complex prompts"
+                        )
+                    
+                    # DPMSolver specific settings
+                    gr.Markdown("#### DPMSolver Advanced Parameters (when using dpmsolver scheduler)")
+                    with gr.Row(equal_height=True):
+                        dpm_algorithm_type = gr.Dropdown(
+                            label="DPM Algorithm Type",
+                            choices=["dpmsolver++", "sde-dpmsolver++"],
+                            value="sde-dpmsolver++",
+                            info="sde-dpmsolver++ adds controlled randomness for more varied outputs"
+                        )
+                        
+                        dpm_solver_type = gr.Dropdown(
+                            label="DPM Solver Type",
+                            choices=["midpoint", "heun"],
+                            value="heun",
+                            info="Different numerical integration methods"
+                        )
+                    
+                    with gr.Row(equal_height=True):
+                        dpm_solver_order = gr.Slider(
+                            label="DPM Solver Order",
+                            minimum=1,
+                            maximum=3,
+                            value=3,
+                            step=1,
+                            info="Higher order = more accurate but slower"
+                        )
+                        
+                        use_karras_sigmas = gr.Checkbox(
+                            label="Use Karras Sigmas",
+                            value=False,
+                            info="Alternative noise scheduling approach"
+                        )
+                    
+                    # Hide dynamic thresholding - keep as hidden components for compatibility
+                    with gr.Row(equal_height=True, visible=False):
+                        enable_dynamic_thresholding = gr.Checkbox(
+                            label="Enable Dynamic Thresholding",
+                            value=False,
+                            visible=False  # Hidden
+                        )
+                        
+                        dynamic_thresholding_ratio = gr.Slider(
+                            label="Dynamic Thresholding Ratio",
+                            minimum=0.5,
+                            maximum=1.0,
+                            value=0.95,
+                            step=0.05,
+                            visible=False  # Hidden
+                        )
+                    
+                    # Flow Scheduler specific settings
+                    gr.Markdown("#### Flow Scheduler Parameters (when using euler scheduler)")
+                    with gr.Row(equal_height=True):
+                        enable_dynamic_time_shift = gr.Checkbox(
+                            label="Enable Dynamic Time Shift",
+                            value=True,
+                            info="Enables adaptive time shifting for better quality"
+                        )
+
                 # Reset negative prompt function
                 def reset_negative_prompt():
                     return NEGATIVE_PROMPT
@@ -798,39 +1063,6 @@ def main(args):
                     fn=reset_negative_prompt,
                     outputs=[negative_prompt]
                 )
-
-                with gr.Row(equal_height=True):
-                    scheduler_input = gr.Dropdown(
-                        label="Scheduler",
-                        choices=["euler", "dpmsolver"],
-                        value="dpmsolver",
-                        info="The scheduler to use for the model.",
-                    )
-
-                    num_inference_steps = gr.Slider(
-                        label="Inference Steps", minimum=20, maximum=100, value=30, step=1
-                    )
-                with gr.Row(equal_height=True):
-                    num_images_per_prompt = gr.Slider(
-                        label="Number of images per prompt",
-                        minimum=1,
-                        maximum=4,
-                        value=1,
-                        step=1,
-                    )
-
-                    seed_input = gr.Slider(
-                        label="Seed", minimum=-1, maximum=2147483647, value=-1, step=1,
-                        elem_id="seed-slider"
-                    )
-                with gr.Row(equal_height=True):
-                    max_input_image_side_length = gr.Slider(
-                        label="max_input_image_side_length",
-                        minimum=256,
-                        maximum=2048,
-                        value=1024,
-                        step=256,
-                    )
 
             with gr.Column():
                 with gr.Column():
@@ -872,9 +1104,109 @@ def main(args):
         else:
             print("Load-on-demand mode enabled. Models will be loaded when needed.")
 
+        def update_generation_info_with_error(error_message):
+            """Create error display for the generation info box"""
+            return f"""
+            <div style='background-color: #422; color: #fcc; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 13px; border-left: 4px solid #f44;'>
+                <strong>❌ Generation Error:</strong><br>
+                {error_message}
+            </div>
+            """
+
+        def handle_oom_error():
+            """Handle Out of Memory errors gracefully"""
+            global pipeline, accelerator, load_on_demand
+            print("🚨 Out of Memory detected. Attempting recovery...")
+            
+            try:
+                # Clear CUDA cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
+                # Force garbage collection
+                gc.collect()
+                
+                # Unload pipeline to free VRAM
+                if 'pipeline' in globals() and pipeline is not None:
+                    print("🔄 Unloading pipeline to free VRAM...")
+                    unload_pipeline()
+                
+                print("✅ Recovery attempt completed. VRAM should be freed.")
+                return "Out of Memory error occurred. Pipeline unloaded to free VRAM. Try reducing image dimensions, batch size, or inference steps."
+                
+            except Exception as e:
+                print(f"⚠️ Error during OOM recovery: {e}")
+                return f"Out of Memory error occurred. Recovery attempt failed: {str(e)}"
+
+        def cancel_generation():
+            """Hard cancel the current generation"""
+            global generation_cancelled, cancel_event, generation_thread, load_on_demand, pipeline
+            
+            print("🛑 Hard cancellation requested by user")
+            generation_cancelled = True
+            cancel_event.set()
+            
+            # Try to forcibly terminate the generation thread
+            if generation_thread and generation_thread.is_alive():
+                print("🔥 Attempting to forcibly terminate generation thread...")
+                
+                # Give it a moment to check the cancel flag naturally
+                time.sleep(0.1)
+                
+                if generation_thread.is_alive():
+                    # Force terminate the thread
+                    success = terminate_thread(generation_thread)
+                    if success:
+                        print("✅ Generation thread terminated")
+                    else:
+                        print("⚠️ Could not terminate thread cleanly")
+                
+                # Wait a bit for cleanup
+                time.sleep(0.2)
+            
+            # Force cleanup regardless of thread termination success
+            try:
+                # Clear CUDA cache aggressively
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
+                # Force garbage collection
+                gc.collect()
+                
+                # Unload/reload pipeline depending on mode
+                if pipeline is not None:
+                    if load_on_demand:
+                        print("🔄 Unloading pipeline due to cancellation in load-on-demand mode...")
+                        unload_pipeline()
+                    else:
+                        print("🔄 Reloading pipeline due to hard cancellation...")
+                        try:
+                            # Try to reinitialize the pipeline
+                            global accelerator
+                            if accelerator is not None:
+                                # Get the args from somewhere - we'll need to pass them
+                                # For now, just unload and let it reload on next generation
+                                unload_pipeline()
+                                print("⚠️ Pipeline unloaded. Will reload on next generation.")
+                        except Exception as e:
+                            print(f"⚠️ Error during pipeline reload: {e}")
+                            unload_pipeline()
+                
+                print("✅ Cancellation cleanup completed")
+                return "Generation forcibly cancelled and cleaned up"
+                
+            except Exception as e:
+                print(f"⚠️ Error during cancellation cleanup: {e}")
+                return f"Generation cancelled but cleanup had errors: {str(e)}"
+
         def update_generation_info(instruction, width, height, scheduler, steps, negative_prompt, 
                                  text_guidance, image_guidance, cfg_start, cfg_end, num_images, 
-                                 max_side, max_pixels, seed, output_img):
+                                 max_side, max_pixels, seed, output_img, error_message=None):
+            if error_message:
+                return update_generation_info_with_error(error_message)
+            
             if output_img is None:
                 return """
                 <div style='background-color: #222; color: #eee; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 13px;'>No generation yet</div>
@@ -909,6 +1241,41 @@ def main(args):
             """
             return info_html
 
+        def threaded_generation_wrapper(
+            instruction, width_input, height_input, scheduler, num_inference_steps,
+            image_input_1, image_input_2, image_input_3, negative_prompt,
+            guidance_scale_input, img_guidance_scale_input, cfg_range_start, cfg_range_end,
+            num_images_per_prompt, max_input_image_side_length, max_pixels,
+            seed_input, rotary_theta, max_sequence_length, dpm_algorithm_type,
+            dpm_solver_type, dpm_solver_order, use_karras_sigmas,
+            enable_dynamic_thresholding, dynamic_thresholding_ratio,
+            enable_dynamic_time_shift, save_images_enabled, align_res, args
+        ):
+            """Wrapper function to run generation in a separate thread"""
+            global generation_result, generation_exception
+            
+            try:
+                result = run(
+                    instruction, width_input, height_input, scheduler, num_inference_steps,
+                    image_input_1, image_input_2, image_input_3, negative_prompt,
+                    guidance_scale_input, img_guidance_scale_input, cfg_range_start, cfg_range_end,
+                    num_images_per_prompt, max_input_image_side_length, max_pixels,
+                    seed_input, rotary_theta, max_sequence_length, dpm_algorithm_type,
+                    dpm_solver_type, dpm_solver_order, use_karras_sigmas,
+                    enable_dynamic_thresholding, dynamic_thresholding_ratio,
+                    enable_dynamic_time_shift, save_images_enabled, None, align_res, args
+                )
+                generation_result = result
+                generation_exception = None
+            except ThreadKilledException:
+                print("🛑 Generation thread was forcibly terminated")
+                generation_result = None
+                generation_exception = ThreadKilledException("Generation was forcibly cancelled")
+            except Exception as e:
+                print(f"❌ Generation thread failed: {e}")
+                generation_result = None
+                generation_exception = e
+
         def run_with_align_res(
             instruction,
             width_input,
@@ -928,35 +1295,81 @@ def main(args):
             max_pixels_mp,
             seed_input,
             aspect_ratio_choice,
+            # Advanced parameters
+            rotary_theta,
+            max_sequence_length,
+            dpm_algorithm_type,
+            dpm_solver_type,
+            dpm_solver_order,
+            use_karras_sigmas,
+            enable_dynamic_thresholding,
+            dynamic_thresholding_ratio,
+            enable_dynamic_time_shift,
             save_images_enabled,
             progress=gr.Progress(),
         ):
+            global generation_thread, generation_result, generation_exception, generation_cancelled
+            
             align_res = aspect_ratio_choice == "Use Image1 Aspect Ratio"
             max_pixels = int(max_pixels_mp * 1_000_000)
-            result = run(
-                instruction,
-                width_input,
-                height_input,
-                scheduler,
-                num_inference_steps,
-                image_input_1,
-                image_input_2,
-                image_input_3,
-                negative_prompt,
-                guidance_scale_input,
-                img_guidance_scale_input,
-                cfg_range_start,
-                cfg_range_end,
-                num_images_per_prompt,
-                max_input_image_side_length,
-                max_pixels,
-                seed_input,
-                save_images_enabled,
-                progress,
-                align_res,
-                args,
+            
+            # Reset global state
+            generation_result = None
+            generation_exception = None
+            generation_cancelled = False
+            
+            # Start generation in a separate thread
+            generation_thread = threading.Thread(
+                target=threaded_generation_wrapper,
+                args=(
+                    instruction, width_input, height_input, scheduler, num_inference_steps,
+                    image_input_1, image_input_2, image_input_3, negative_prompt,
+                    guidance_scale_input, img_guidance_scale_input, cfg_range_start, cfg_range_end,
+                    num_images_per_prompt, max_input_image_side_length, max_pixels,
+                    seed_input, rotary_theta, max_sequence_length, dpm_algorithm_type,
+                    dpm_solver_type, dpm_solver_order, use_karras_sigmas,
+                    enable_dynamic_thresholding, dynamic_thresholding_ratio,
+                    enable_dynamic_time_shift, save_images_enabled, align_res, args
+                ),
+                daemon=True
             )
-            return result
+            
+            generation_thread.start()
+            
+            # Wait for completion or cancellation with progress updates
+            start_time = time.time()
+            while generation_thread.is_alive():
+                if generation_cancelled:
+                    # Cancellation was requested, thread should be terminated by cancel_generation()
+                    break
+                
+                # Update progress if we can estimate it
+                elapsed = time.time() - start_time
+                if progress and elapsed > 1:
+                    # Rough progress estimation based on time (very crude)
+                    estimated_total = 60  # Assume 60 seconds for generation
+                    progress_frac = min(elapsed / estimated_total, 0.9)
+                    progress(progress_frac)
+                
+                time.sleep(0.1)
+            
+            # Wait for thread to finish (or timeout)
+            generation_thread.join(timeout=1.0)
+            
+            # Check results
+            if generation_cancelled:
+                raise Exception("Generation was cancelled by user")
+            
+            if generation_exception:
+                if isinstance(generation_exception, ThreadKilledException):
+                    raise Exception("Generation was forcibly cancelled")
+                else:
+                    raise generation_exception
+            
+            if generation_result is None:
+                raise Exception("Generation failed - no result returned")
+            
+            return generation_result
 
         # Function to handle both generation and info update
         def generate_and_update_info(
@@ -978,46 +1391,112 @@ def main(args):
             max_pixels_mp,
             seed_input,
             aspect_ratio,
+            # Advanced parameters
+            rotary_theta,
+            max_sequence_length,
+            dpm_algorithm_type,
+            dpm_solver_type,
+            dpm_solver_order,
+            use_karras_sigmas,
+            enable_dynamic_thresholding,
+            dynamic_thresholding_ratio,
+            enable_dynamic_time_shift,
             save_images_enabled,
             progress=gr.Progress(),
         ):
-            # Generate the image and get the actual seed used
-            output_image_result, all_images, actual_seed = run_with_align_res(
-                instruction,
-                width_input,
-                height_input,
-                scheduler_input,
-                num_inference_steps,
-                image_input_1,
-                image_input_2,
-                image_input_3,
-                negative_prompt,
-                text_guidance_scale_input,
-                image_guidance_scale_input,
-                cfg_range_start,
-                cfg_range_end,
-                num_images_per_prompt,
-                max_input_image_side_length,
-                max_pixels_mp,
-                seed_input,
-                aspect_ratio,
-                save_images_enabled,
-                progress,
-            )
+            global generation_cancelled, cancel_event
             
-            # Generate the info using the actual seed
-            info_html = update_generation_info(
-                instruction, width_input, height_input, scheduler_input, num_inference_steps, negative_prompt, 
-                text_guidance_scale_input, image_guidance_scale_input, cfg_range_start, cfg_range_end, num_images_per_prompt, 
-                max_input_image_side_length, int(max_pixels_mp * 1_000_000), actual_seed, output_image_result
-            )
+            # Reset cancellation state
+            generation_cancelled = False
+            cancel_event.clear()
             
-            # Return individual images for gallery display
-            return all_images, info_html
+            try:
+                # Generate the image and get the actual seed used
+                output_image_result, all_images, actual_seed = run_with_align_res(
+                    instruction,
+                    width_input,
+                    height_input,
+                    scheduler_input,
+                    num_inference_steps,
+                    image_input_1,
+                    image_input_2,
+                    image_input_3,
+                    negative_prompt,
+                    text_guidance_scale_input,
+                    image_guidance_scale_input,
+                    cfg_range_start,
+                    cfg_range_end,
+                    num_images_per_prompt,
+                    max_input_image_side_length,
+                    max_pixels_mp,
+                    seed_input,
+                    aspect_ratio,
+                    # Advanced parameters
+                    rotary_theta,
+                    max_sequence_length,
+                    dpm_algorithm_type,
+                    dpm_solver_type,
+                    dpm_solver_order,
+                    use_karras_sigmas,
+                    enable_dynamic_thresholding,
+                    dynamic_thresholding_ratio,
+                    enable_dynamic_time_shift,
+                    save_images_enabled,
+                    progress,
+                )
+                
+                if generation_cancelled:
+                    error_message = "Generation was cancelled by user"
+                    generation_info_result = update_generation_info(
+                        instruction, width_input, height_input, scheduler_input, num_inference_steps,
+                        negative_prompt, text_guidance_scale_input, image_guidance_scale_input,
+                        cfg_range_start, cfg_range_end, num_images_per_prompt, max_input_image_side_length,
+                        int(max_pixels_mp * 1_000_000), actual_seed, None, error_message
+                    )
+                    return None, generation_info_result
+                
+                # Update the generation info with successful parameters
+                generation_info_result = update_generation_info(
+                    instruction, width_input, height_input, scheduler_input, num_inference_steps,
+                    negative_prompt, text_guidance_scale_input, image_guidance_scale_input,
+                    cfg_range_start, cfg_range_end, num_images_per_prompt, max_input_image_side_length,
+                    int(max_pixels_mp * 1_000_000), actual_seed, output_image_result
+                )
+                
+                return all_images, generation_info_result
+                
+            except torch.cuda.OutOfMemoryError as e:
+                error_message = handle_oom_error()
+                generation_info_result = update_generation_info(
+                    instruction, width_input, height_input, scheduler_input, num_inference_steps,
+                    negative_prompt, text_guidance_scale_input, image_guidance_scale_input,
+                    cfg_range_start, cfg_range_end, num_images_per_prompt, max_input_image_side_length,
+                    int(max_pixels_mp * 1_000_000), seed_input, None, error_message
+                )
+                return None, generation_info_result
+                
+            except Exception as e:
+                error_message = f"Generation failed: {str(e)}"
+                print(f"❌ Generation error: {error_message}")
+                print(f"Traceback: {traceback.format_exc()}")
+                
+                generation_info_result = update_generation_info(
+                    instruction, width_input, height_input, scheduler_input, num_inference_steps,
+                    negative_prompt, text_guidance_scale_input, image_guidance_scale_input,
+                    cfg_range_start, cfg_range_end, num_images_per_prompt, max_input_image_side_length,
+                    int(max_pixels_mp * 1_000_000), seed_input, None, error_message
+                )
+                return None, generation_info_result
 
-        # click
-        generate_event = generate_button.click(
-            generate_and_update_info,
+        # Connect the cancel button
+        cancel_button.click(
+            fn=lambda: cancel_generation(),
+            outputs=[generation_info]
+        )
+
+        # Connect the generate button
+        generate_button.click(
+            fn=generate_and_update_info,
             inputs=[
                 instruction,
                 width_input,
@@ -1037,6 +1516,16 @@ def main(args):
                 max_pixels_mp,
                 seed_input,
                 aspect_ratio,
+                # Advanced parameters
+                rotary_theta,
+                max_sequence_length,
+                dpm_algorithm_type,
+                dpm_solver_type,
+                dpm_solver_order,
+                use_karras_sigmas,
+                enable_dynamic_thresholding,
+                dynamic_thresholding_ratio,
+                enable_dynamic_time_shift,
                 save_images,
             ],
             outputs=[output_display, generation_info],
@@ -1044,7 +1533,7 @@ def main(args):
 
         # Add Enter key handler for prompt box
         instruction.submit(
-            generate_and_update_info,
+            fn=generate_and_update_info,
             inputs=[
                 instruction,
                 width_input,
@@ -1064,6 +1553,16 @@ def main(args):
                 max_pixels_mp,
                 seed_input,
                 aspect_ratio,
+                # Advanced parameters
+                rotary_theta,
+                max_sequence_length,
+                dpm_algorithm_type,
+                dpm_solver_type,
+                dpm_solver_order,
+                use_karras_sigmas,
+                enable_dynamic_thresholding,
+                dynamic_thresholding_ratio,
+                enable_dynamic_time_shift,
                 save_images,
             ],
             outputs=[output_display, generation_info],
